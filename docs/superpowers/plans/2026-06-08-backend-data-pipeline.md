@@ -273,25 +273,39 @@ func TestDecode_TemplateThenData(t *testing.T) {
 	d := NewDecoder()
 	packet := buildPacket(t)
 
+	// The decoder applies a newly-learned template immediately, in the same
+	// Decode call — flowsets are processed in the order they appear in the
+	// packet, and the template (flowSetID=0) precedes the data (flowSetID=256)
+	// in buildPacket's byte layout. So the very first call already decodes
+	// the flow record correctly.
 	flows, err := d.Decode("192.0.2.1:2055", packet)
 	if err != nil {
 		t.Fatalf("Decode returned error: %v", err)
 	}
-	if len(flows) != 0 {
-		t.Fatalf("expected 0 flows from a template-only packet (data uses a template defined in the SAME packet, which real exporters never do); got %d", len(flows))
+	if len(flows) != 1 {
+		t.Fatalf("expected 1 flow on first decode (template precedes data in the same packet), got %d", len(flows))
 	}
+	assertFlow(t, flows[0])
 
-	// Send the SAME packet again: now the decoder has the template cached
-	// from the first pass, so the data flowset in this second packet decodes.
-	flows, err = d.Decode("192.0.2.1:2055", packet)
+	// Sending another packet that contains ONLY a data flowset (no template)
+	// should still decode correctly, because the decoder cached the template
+	// from the first packet — this is what real exporters rely on: they send
+	// templates periodically, then many subsequent packets carry only data
+	// flowsets referencing the cached template.
+	dataOnlyPacket := buildDataOnlyPacket(t)
+	flows, err = d.Decode("192.0.2.1:2055", dataOnlyPacket)
 	if err != nil {
 		t.Fatalf("second Decode returned error: %v", err)
 	}
 	if len(flows) != 1 {
-		t.Fatalf("expected 1 flow on second decode, got %d", len(flows))
+		t.Fatalf("expected 1 flow on second decode using the cached template, got %d", len(flows))
 	}
+	assertFlow(t, flows[0])
+}
 
-	f := flows[0]
+// assertFlow checks a decoded Flow against the values buildPacket/buildDataOnlyPacket encode.
+func assertFlow(t *testing.T, f Flow) {
+	t.Helper()
 	if f.SrcIP.String() != "10.0.0.1" || f.DstIP.String() != "93.184.216.34" {
 		t.Errorf("unexpected IPs: src=%s dst=%s", f.SrcIP, f.DstIP)
 	}
@@ -301,6 +315,40 @@ func TestDecode_TemplateThenData(t *testing.T) {
 	if f.Protocol != 6 || f.Bytes != 1500 || f.Packets != 10 {
 		t.Errorf("unexpected proto/bytes/packets: %d/%d/%d", f.Protocol, f.Bytes, f.Packets)
 	}
+}
+
+// buildDataOnlyPacket assembles a NetFlow v9 packet containing ONLY a Data
+// FlowSet for template 256 (no Template FlowSet) — modeling a packet an
+// exporter sends after it already sent the template in an earlier packet.
+// The record encodes the same field values as buildPacket's, in the same
+// 7-field layout (IN_BYTES, IN_PKTS, PROTOCOL, L4_SRC_PORT, IPV4_SRC_ADDR,
+// L4_DST_PORT, IPV4_DST_ADDR), so assertFlow can check both packets identically.
+func buildDataOnlyPacket(t *testing.T) []byte {
+	t.Helper()
+	var buf []byte
+
+	buf = appendU16(buf, 9)          // version
+	buf = appendU16(buf, 1)          // count
+	buf = appendU32(buf, 0)          // sysUptime
+	buf = appendU32(buf, 1700000001) // unixSecs
+	buf = appendU32(buf, 2)          // sequence
+	buf = appendU32(buf, 0)          // sourceID
+
+	var rec []byte
+	rec = appendU32(rec, 1500)
+	rec = appendU32(rec, 10)
+	rec = append(rec, 6)
+	rec = appendU16(rec, 51000)
+	rec = append(rec, net.ParseIP("10.0.0.1").To4()...)
+	rec = appendU16(rec, 443)
+	rec = append(rec, net.ParseIP("93.184.216.34").To4()...)
+
+	dataFlowSetLen := 4 + len(rec)
+	buf = appendU16(buf, 256)
+	buf = appendU16(buf, uint16(dataFlowSetLen))
+	buf = append(buf, rec...)
+
+	return buf
 }
 ```
 
@@ -495,7 +543,7 @@ func decodeUint(raw []byte) uint64 {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd backend && go test ./internal/collector/netflowv9/... -v`
-Expected: PASS — `TestDecode_TemplateThenData` passes (first call returns 0 flows because the template arrives in the same packet as the data — real exporters send templates in earlier packets; the second call, with the template now cached, decodes the flow correctly).
+Expected: PASS — `TestDecode_TemplateThenData` passes (the template FlowSet precedes the data FlowSet in `buildPacket`'s byte layout, so the decoder learns the template and decodes the record in the very same first call — 1 flow; the second call sends a template-less packet and decodes correctly using the cached template — also 1 flow, with identical field values).
 
 - [ ] **Step 5: Commit**
 

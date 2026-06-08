@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+frontend/dist/
+backend/public/
+*.exe
+*.test
+
+# GeoIP databases (proprietary, fetched via README instructions)
+geoip/*.mmdb
+
+# Logs
+suricata/logs/*
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/

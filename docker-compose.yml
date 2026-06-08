@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    container_name: fluxio-clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./db/clickhouse/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: fluxio-postgres
+    environment:
+      POSTGRES_USER: fluxio
+      POSTGRES_PASSWORD: fluxio_password
+      POSTGRES_DB: fluxioclient
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  suricata:
+    image: jasonish/suricata:latest
+    container_name: fluxio-suricata
+    network_mode: host # Para escutar interfaces reais, em prod ajustar.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_NICE
+    volumes:
+      - ./suricata/logs:/var/log/suricata
+    command: -i any # Em produção, substitua "any" pela interface de espelhamento ou use o frontend UDP
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: fluxio-backend
+    ports:
+      - "80:8080"  # Servirá a API e o Frontend na porta 80 nativa
+      - "2055:2055/udp" # NetFlow/IPFIX
+      - "37008:37008/udp" # TZSP
+    volumes:
+      - ./suricata/logs:/var/log/suricata:ro
+    environment:
+      - CLICKHOUSE_DSN=clickhouse://default:@clickhouse:9000/fluxio
+      - POSTGRES_DSN=postgres://fluxio:fluxio_password@postgres:5432/fluxioclient?sslmode=disable
+      - WAZUH_MANAGER_IP=192.168.1.100 # Substitua pelo IP do seu Wazuh
+      - WAZUH_MANAGER_PORT=1514 # Porta syslog ou API do Wazuh
+    depends_on:
+      - clickhouse
+      - postgres
+
+volumes:
+  clickhouse-data:
+  postgres-data:

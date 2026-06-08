@@ -3,49 +3,61 @@ package collector
 import (
 	"log"
 	"net"
+	"time"
+
+	"fluxio-backend/internal/collector/netflowv9"
+	"fluxio-backend/internal/processor"
 )
 
-// StartNetFlowListener starts a UDP listener for NetFlow v9 / IPFIX
-func StartNetFlowListener(port string) {
+// StartNetFlowListener listens for NetFlow v9 / IPFIX UDP packets on the given
+// port, decodes them, and pushes normalized FlowRecords onto out. It runs
+// until the process exits; malformed packets are logged and skipped so a
+// single bad exporter can't take the listener down.
+func StartNetFlowListener(port string, out chan<- processor.FlowRecord) {
 	addr, err := net.ResolveUDPAddr("udp", ":"+port)
 	if err != nil {
-		log.Fatalf("Error resolving UDP address: %v", err)
+		log.Fatalf("netflow: error resolving UDP address: %v", err)
 	}
 
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		log.Fatalf("Error listening on UDP %s: %v", port, err)
+		log.Fatalf("netflow: error listening on UDP %s: %v", port, err)
 	}
 	defer conn.Close()
 
-	log.Printf("Listening for NetFlow on UDP %s", port)
+	log.Printf("netflow: listening for NetFlow v9/IPFIX on UDP %s", port)
 
+	decoder := netflowv9.NewDecoder()
 	buf := make([]byte, 8192)
 	for {
 		n, remoteAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("Error reading from UDP: %v", err)
+			log.Printf("netflow: error reading from UDP: %v", err)
 			continue
 		}
 
-		// Parse the NetFlow packet (stubbed logic for demonstration)
-		// goflow2 provides complex decoders, here we show the entrypoint
-		log.Printf("Received %d bytes from %v", n, remoteAddr)
-		
-		// DPI EXTRACTION STUB
-		// Ao processar os templates NetFlow IPFIX ou ler o payload (se for sFlow),
-		// procuramos programaticamente assinaturas de L7 (Camada de Aplicação).
-		extractDpiMetadata(buf[:n])
+		flows, err := decoder.Decode(remoteAddr.String(), buf[:n])
+		if err != nil {
+			log.Printf("netflow: dropping malformed packet from %v: %v", remoteAddr, err)
+			continue
+		}
 
-		// In a complete implementation, we use format decoders here:
-		// e.g. netflow.DecodeMessage(buf[:n])
+		now := time.Now().UTC()
+		for _, flow := range flows {
+			out <- toFlowRecord(flow, now)
+		}
 	}
 }
 
-func extractDpiMetadata(payload []byte) {
-	// Lógica de dissecação.
-	// Em fluxos não-encriptados na porta 53 (DNS), podemos extrair os QNames.
-	// No Client Hello do TLS (Handshake type 1), podemos buscar a extensão SNI.
-	// Isso permite inferir se o tráfego é Netflix, WhatsApp, etc.
-	log.Println("[DPI] Processing L7 metadata (SNI/DNS) for app categorization...")
+func toFlowRecord(flow netflowv9.Flow, receivedAt time.Time) processor.FlowRecord {
+	return processor.FlowRecord{
+		Timestamp:       receivedAt,
+		SourceIP:        flow.SrcIP.String(),
+		DestinationIP:   flow.DstIP.String(),
+		SourcePort:      flow.SrcPort,
+		DestinationPort: flow.DstPort,
+		Protocol:        flow.Protocol,
+		Bytes:           flow.Bytes,
+		Packets:         flow.Packets,
+	}
 }

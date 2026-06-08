@@ -4,23 +4,6 @@ import (
 	"log"
 )
 
-// FlowRecord represents a normalized network flow
-type FlowRecord struct {
-	SourceIP        string
-	DestinationIP   string
-	SourcePort      uint16
-	DestinationPort uint16
-	Protocol        uint8
-	Bytes           uint64
-	Packets         uint64
-	Application     string
-	// Enriched fields
-	SourceCountry   string
-	DestCountry     string
-	SourceASN       uint32
-	DestASN         uint32
-}
-
 // EnrichFlow takes a raw flow record and adds GeoIP and ASN information
 func EnrichFlow(flow *FlowRecord) {
 	// In a complete implementation, this would query the MaxMind GeoIP2/ASN databases.

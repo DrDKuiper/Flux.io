@@ -3,10 +3,6 @@ package collector
 import (
 	"log"
 	"net"
-
-	"github.com/netsampler/goflow2/v2/decoders/netflow"
-	"github.com/netsampler/goflow2/v2/decoders/netflow/netflow9"
-	"github.com/netsampler/goflow2/v2/decoders/utils"
 )
 
 // StartNetFlowListener starts a UDP listener for NetFlow v9 / IPFIX
@@ -43,9 +39,6 @@ func StartNetFlowListener(port string) {
 
 		// In a complete implementation, we use format decoders here:
 		// e.g. netflow.DecodeMessage(buf[:n])
-		_ = netflow.ErrorTemplateNotFound
-		_ = netflow9.ErrorTemplateNotFound
-		_ = utils.DecodeUNumber([]byte{0}, 1)
 	}
 }
 

@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { BrowserRouter as Router, Routes, Route, Link, Navigate } from 'react-router-dom';
-import { Activity, ShieldAlert, Map as MapIcon, GitCommit, LogOut } from 'lucide-react';
+import { Activity, ShieldAlert, Map as MapIcon, GitCommit, LogOut, Settings as SettingsIcon } from 'lucide-react';
+import Settings from './pages/Settings';
 import { MapContainer, TileLayer, Marker, Popup } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 
@@ -143,6 +144,10 @@ function App() {
               <MapIcon className="w-5 h-5" />
               <span>Geo Map</span>
             </Link>
+            <Link to="/settings" className="flex items-center space-x-3 px-4 py-3 text-gray-300 hover:bg-gray-900 hover:text-white rounded-lg transition-colors">
+              <SettingsIcon className="w-5 h-5" />
+              <span>Configurações</span>
+            </Link>
           </nav>
           
           <div className="p-4 border-t border-gray-800">
@@ -158,6 +163,7 @@ function App() {
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/map" element={<FlowMap />} />
+            <Route path="/settings" element={<Settings />} />
             <Route path="*" element={<Navigate to="/" />} />
           </Routes>
         </div>

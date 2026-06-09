@@ -53,6 +53,9 @@ func u16(v uint16) []byte {
 	return b
 }
 
+// u24 encodes v as a 3-byte big-endian integer. Precondition: v <= 0xFFFFFF
+// (values > 16 MiB are silently truncated, but TLS handshake bodies are
+// always far smaller than this limit).
 func u24(v uint32) []byte {
 	b := make([]byte, 4)
 	binary.BigEndian.PutUint32(b, v)

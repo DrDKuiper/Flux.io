@@ -2,6 +2,7 @@ package collector
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -16,16 +17,16 @@ const tzspTagEndOfFields = 0x01
 
 // StartTZSPListener listens for TZSP-encapsulated packet copies (e.g. from a
 // switch mirror port) on the given UDP port, decapsulates each one, and
-// stores any extracted SNI/DNS metadata in cache. It runs until the process
-// exits or the socket errors; malformed packets are logged and skipped.
-func StartTZSPListener(port string, cache *processor.CorrelationCache) {
+// stores any extracted SNI/DNS metadata in cache. It runs until the socket
+// is closed or returns a permanent error, then returns that error.
+func StartTZSPListener(port string, cache *processor.CorrelationCache) error {
 	addr, err := net.ResolveUDPAddr("udp", ":"+port)
 	if err != nil {
-		log.Fatalf("tzsp: error resolving UDP address: %v", err)
+		return fmt.Errorf("tzsp: resolving UDP address: %w", err)
 	}
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		log.Fatalf("tzsp: error listening on UDP %s: %v", port, err)
+		return fmt.Errorf("tzsp: listening on UDP %s: %w", port, err)
 	}
 	defer conn.Close()
 
@@ -35,7 +36,10 @@ func StartTZSPListener(port string, cache *processor.CorrelationCache) {
 	for {
 		n, _, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("tzsp: error reading from UDP: %v", err)
+			if errors.Is(err, net.ErrClosed) {
+				return nil // normal shutdown
+			}
+			log.Printf("tzsp: read error: %v", err)
 			continue
 		}
 		processTZSPPacket(append([]byte(nil), buf[:n]...), cache)
@@ -111,7 +115,12 @@ func decapsulateTZSP(raw []byte) ([]byte, error) {
 			return nil, fmt.Errorf("truncated TZSP tag at offset %d", offset)
 		}
 		length := int(raw[offset])
-		offset += 1 + length
+		offset++ // consume the length byte
+		if offset+length > len(raw) {
+			return nil, fmt.Errorf("TZSP TLV value claims length %d but only %d bytes remain at offset %d",
+				length, len(raw)-offset, offset)
+		}
+		offset += length
 	}
 
 	return raw[offset:], nil

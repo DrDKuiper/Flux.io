@@ -1,6 +1,7 @@
 package collector
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -19,7 +20,7 @@ const tzspTagEndOfFields = 0x01
 // switch mirror port) on the given UDP port, decapsulates each one, and
 // stores any extracted SNI/DNS metadata in cache. It runs until the socket
 // is closed or returns a permanent error, then returns that error.
-func StartTZSPListener(port string, cache *processor.CorrelationCache) error {
+func StartTZSPListener(ctx context.Context, port string, cache *processor.CorrelationCache) error {
 	addr, err := net.ResolveUDPAddr("udp", ":"+port)
 	if err != nil {
 		return fmt.Errorf("tzsp: resolving UDP address: %w", err)
@@ -30,6 +31,12 @@ func StartTZSPListener(port string, cache *processor.CorrelationCache) error {
 	}
 	defer conn.Close()
 
+	// Close the connection when ctx is cancelled so ReadFromUDP unblocks immediately.
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+
 	log.Printf("tzsp: listening for TZSP packet captures on UDP %s", port)
 
 	buf := make([]byte, 65535)
@@ -37,7 +44,7 @@ func StartTZSPListener(port string, cache *processor.CorrelationCache) error {
 		n, _, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
-				return nil // normal shutdown
+				return nil // context cancelled or normal shutdown
 			}
 			log.Printf("tzsp: read error: %v", err)
 			continue

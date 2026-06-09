@@ -62,6 +62,9 @@ func main() {
 	defer pgDB.Close()
 	settingsRepo := settings.NewRepository(pgDB)
 
+	pipelineCtx, cancelPipeline := context.WithCancel(context.Background())
+	defer cancelPipeline()
+
 	correlationCache := processor.NewCorrelationCache(30 * time.Second)
 	go correlationCache.CleanupLoop(pipelineCtx, 10*time.Second)
 
@@ -79,7 +82,7 @@ func main() {
 			collector.RunSuricataCorrelator(ctx, collector.NewFileTailer(eveLogPath), correlationCache)
 		},
 		TZSP: func(ctx context.Context) {
-			if err := collector.StartTZSPListener(tzspPort, correlationCache); err != nil {
+			if err := collector.StartTZSPListener(ctx, tzspPort, correlationCache); err != nil {
 				log.Printf("tzsp: listener stopped: %v", err)
 			}
 		},
@@ -134,9 +137,6 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-
-	pipelineCtx, cancelPipeline := context.WithCancel(context.Background())
-	defer cancelPipeline()
 
 	store, err := storage.NewClickHouseStore(os.Getenv("CLICKHOUSE_DSN"))
 	if err != nil {

@@ -91,13 +91,20 @@ func (m *DPIManager) Stop() {
 	m.mode = "none"
 }
 
-// stopLocked cancels and waits for the current source. Caller must hold m.mu.
+// stopLocked cancels the current source and waits for it to exit.
+// It briefly releases m.mu while waiting so a source goroutine that calls
+// back into the manager (or any other caller) is not deadlocked.
+// Caller must hold m.mu on entry; it will still hold m.mu on return.
 func (m *DPIManager) stopLocked() {
 	if m.cancel == nil {
 		return
 	}
-	m.cancel()
-	<-m.done
+	cancel := m.cancel
+	done := m.done
 	m.cancel = nil
 	m.done = nil
+	cancel()
+	m.mu.Unlock()
+	<-done // wait without holding the lock
+	m.mu.Lock()
 }

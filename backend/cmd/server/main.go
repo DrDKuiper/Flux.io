@@ -77,9 +77,17 @@ func main() {
 		tzspPort = "37008"
 	}
 
+	store, err := storage.NewClickHouseStore(os.Getenv("CLICKHOUSE_DSN"))
+	if err != nil {
+		log.Fatalf("Failed to connect to ClickHouse: %v", err)
+	}
+
+	writer := storage.NewBatchWriter(store, 1000, 5*time.Second)
+	go writer.Run(pipelineCtx)
+
 	dpiManager := collector.NewDPIManager(correlationCache, collector.DPIManagerSources{
 		Suricata: func(ctx context.Context) {
-			collector.RunSuricataCorrelator(ctx, collector.NewFileTailer(eveLogPath), correlationCache)
+			collector.RunSuricataCorrelator(ctx, collector.NewFileTailer(eveLogPath), correlationCache, writer)
 		},
 		TZSP: func(ctx context.Context) {
 			if err := collector.StartTZSPListener(ctx, tzspPort, correlationCache); err != nil {
@@ -98,6 +106,13 @@ func main() {
 	}
 
 	registerSettingsRoutes(api, settingsRepo, dpiManager)
+
+	wazuhIP := os.Getenv("WAZUH_MANAGER_IP")
+	wazuhPort := os.Getenv("WAZUH_MANAGER_PORT")
+	if wazuhPort == "" {
+		wazuhPort = "1514"
+	}
+	go collector.RunWazuhForwarder(pipelineCtx, eveLogPath, wazuhIP, wazuhPort)
 
 	api.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok"})
@@ -137,14 +152,6 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-
-	store, err := storage.NewClickHouseStore(os.Getenv("CLICKHOUSE_DSN"))
-	if err != nil {
-		log.Fatalf("Failed to connect to ClickHouse: %v", err)
-	}
-
-	writer := storage.NewBatchWriter(store, 1000, 5*time.Second)
-	go writer.Run(pipelineCtx)
 
 	geoIP, err := processor.NewGeoIPEnricher(os.Getenv("GEOIP_CITY_DB"), os.Getenv("GEOIP_ASN_DB"))
 	if err != nil {

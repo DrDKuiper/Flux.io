@@ -8,14 +8,18 @@ import (
 	"fluxio-backend/internal/processor"
 )
 
-// RunSuricataCorrelator tails eve.json via tailer and stores any DPI
-// metadata it finds (TLS SNI, DNS queries, HTTP hosts) into cache, keyed
-// by each event's 5-tuple. It blocks until ctx is cancelled or the
-// underlying tailer's line channel closes.
-//
-// This is the "suricata" DPI mode: rather than re-implementing protocol
-// inspection, it reuses the analysis Suricata already performs.
-func RunSuricataCorrelator(ctx context.Context, tailer *FileTailer, cache *processor.CorrelationCache) {
+// alertWriter is satisfied by *storage.BatchWriter — separated as an
+// interface so this package doesn't need to import storage, and so tests
+// can use a simple recording fake.
+type alertWriter interface {
+	WriteAlert(alert processor.SuricataAlert)
+}
+
+// RunSuricataCorrelator tails eve.json via tailer, storing any DPI metadata
+// it finds (TLS SNI, DNS queries, HTTP hosts) into cache keyed by 5-tuple,
+// and forwarding any `alert` events to alerts for persistence. It blocks
+// until ctx is cancelled or the underlying tailer's line channel closes.
+func RunSuricataCorrelator(ctx context.Context, tailer *FileTailer, cache *processor.CorrelationCache, alerts alertWriter) {
 	lines := tailer.Lines(ctx)
 
 	for {
@@ -26,12 +30,12 @@ func RunSuricataCorrelator(ctx context.Context, tailer *FileTailer, cache *proce
 			if !ok {
 				return
 			}
-			processEveLine(line, cache)
+			processEveLine(line, cache, alerts)
 		}
 	}
 }
 
-func processEveLine(line string, cache *processor.CorrelationCache) {
+func processEveLine(line string, cache *processor.CorrelationCache, alerts alertWriter) {
 	evt, err := ParseEveLine(line)
 	if err != nil {
 		// Empty/whitespace-only lines are normal (e.g. trailing newline after a write
@@ -46,5 +50,9 @@ func processEveLine(line string, cache *processor.CorrelationCache) {
 	meta, hasMeta := evt.DPIMetadata()
 	if hasTuple && hasMeta {
 		cache.Put(tuple, meta)
+	}
+
+	if alert, ok := evt.ToAlert(); ok {
+		alerts.WriteAlert(alert)
 	}
 }

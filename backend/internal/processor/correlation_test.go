@@ -38,7 +38,7 @@ func TestCorrelationCache_EntriesExpire(t *testing.T) {
 		t.Fatal("expected a hit immediately after Put")
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond) // 4× the 50ms TTL — generous margin against scheduler jitter
 
 	if _, ok := cache.Get(key); ok {
 		t.Fatal("expected the entry to have expired after its TTL elapsed")

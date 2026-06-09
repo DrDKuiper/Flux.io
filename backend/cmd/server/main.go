@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"log"
 	"os"
 	"time"
@@ -9,9 +10,11 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/websocket/v2"
+	_ "github.com/lib/pq"
 
 	"fluxio-backend/internal/collector"
 	"fluxio-backend/internal/processor"
+	"fluxio-backend/internal/settings"
 	"fluxio-backend/internal/storage"
 )
 
@@ -51,6 +54,15 @@ func main() {
 	}))
 
 	api := app.Group("/api")
+
+	pgDB, err := sql.Open("postgres", os.Getenv("POSTGRES_DSN"))
+	if err != nil {
+		log.Fatalf("Failed to open Postgres connection: %v", err)
+	}
+	defer pgDB.Close()
+	settingsRepo := settings.NewRepository(pgDB)
+	registerSettingsRoutes(api, settingsRepo)
+
 	api.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok"})
 	})

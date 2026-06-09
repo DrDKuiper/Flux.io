@@ -25,14 +25,16 @@ func TestFileTailer_StreamsAppendedLines(t *testing.T) {
 	defer cancel()
 
 	tailer := NewFileTailer(path)
-	lines, err := tailer.Lines(ctx)
-	if err != nil {
-		t.Fatalf("Lines returned error: %v", err)
+	// Use a ready channel to reliably wait for the goroutine to open and seek to EOF,
+	// avoiding load-dependent timing.
+	tailer.ready = make(chan struct{})
+	lines := tailer.Lines(ctx)
+	select {
+	case <-tailer.ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for tailer to open file")
 	}
-
-	// Give the tailer a moment to seek to EOF before we append —
-	// it must NOT replay the line written before it started.
-	time.Sleep(100 * time.Millisecond)
+	// Now safe to append — goroutine has already seeked to EOF (offset 0 of the appended content)
 
 	appendFile, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
@@ -63,10 +65,7 @@ func TestFileTailer_RetriesUntilFileExists(t *testing.T) {
 	tailer := NewFileTailer(path)
 	tailer.retryInterval = 50 * time.Millisecond // speed up retries in tests
 
-	lines, err := tailer.Lines(ctx)
-	if err != nil {
-		t.Fatalf("Lines returned error: %v", err)
-	}
+	lines := tailer.Lines(ctx)
 
 	// The goroutine is now retrying every 50ms. Wait briefly to confirm it's
 	// retrying (file still absent), then create the file empty so the goroutine

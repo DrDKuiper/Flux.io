@@ -3,6 +3,7 @@ package collector
 import (
 	"context"
 	"log"
+	"strings"
 
 	"fluxio-backend/internal/processor"
 )
@@ -33,7 +34,11 @@ func RunSuricataCorrelator(ctx context.Context, tailer *FileTailer, cache *proce
 func processEveLine(line string, cache *processor.CorrelationCache) {
 	evt, err := ParseEveLine(line)
 	if err != nil {
-		log.Printf("suricata-correlator: skipping unparseable eve.json line: %v", err)
+		// Empty/whitespace-only lines are normal (e.g. trailing newline after a write
+		// batch); suppress them to avoid log noise on high-throughput sensors.
+		if strings.TrimSpace(line) != "" {
+			log.Printf("suricata-correlator: skipping unparseable eve.json line: %v", err)
+		}
 		return
 	}
 

@@ -57,11 +57,8 @@ func TestRunSuricataCorrelator_PopulatesCacheFromTLSEvents(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// verify flow event did NOT add anything extra to the cache
-	flowKey := processor.FiveTuple{SrcIP: "10.0.0.1", DstIP: "93.184.216.34", SrcPort: 51000, DstPort: 443, Protocol: 6}
-	if _, ok := cache.Get(flowKey); !ok {
-		// This is the same key as the TLS event — just confirm the cache has exactly 1 entry
-	}
+	// The flow event carries no DPI metadata, so cache must still hold exactly one entry
+	// (the TLS event). Verifying Len() == 1 is the definitive check.
 	if cache.Len() != 1 {
 		t.Errorf("expected exactly 1 cache entry (from TLS event only), got %d", cache.Len())
 	}

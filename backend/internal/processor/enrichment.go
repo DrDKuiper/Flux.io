@@ -23,13 +23,19 @@ func NewGeoIPEnricher(cityDBPath, asnDBPath string) (*GeoIPEnricher, error) {
 	e := &GeoIPEnricher{}
 
 	if db, err := geoip2.Open(cityDBPath); err != nil {
-		log.Printf("enrichment: GeoLite2-City database unavailable at %q (%v) — country lookups disabled", cityDBPath, err)
+		log.Printf("enrichment: GeoLite2-City database unavailable at %q (%v) - country lookups disabled", cityDBPath, err)
+	} else if t := db.Metadata().DatabaseType; t != "GeoLite2-City" {
+		db.Close()
+		log.Printf("enrichment: expected GeoLite2-City database at %q but got %q - country lookups disabled", cityDBPath, t)
 	} else {
 		e.cityDB = db
 	}
 
 	if db, err := geoip2.Open(asnDBPath); err != nil {
-		log.Printf("enrichment: GeoLite2-ASN database unavailable at %q (%v) — ASN lookups disabled", asnDBPath, err)
+		log.Printf("enrichment: GeoLite2-ASN database unavailable at %q (%v) - ASN lookups disabled", asnDBPath, err)
+	} else if t := db.Metadata().DatabaseType; t != "GeoLite2-ASN" {
+		db.Close()
+		log.Printf("enrichment: expected GeoLite2-ASN database at %q but got %q - ASN lookups disabled", asnDBPath, t)
 	} else {
 		e.asnDB = db
 	}

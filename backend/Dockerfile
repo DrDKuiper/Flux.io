@@ -10,8 +10,10 @@ RUN npm run build
 FROM golang:1.22-alpine AS backend-builder
 WORKDIR /app/backend
 RUN apk add --no-cache gcc musl-dev libpcap-dev
-COPY backend/go.mod backend/go.sum* ./
-RUN go mod download || echo "No dependencies to download yet or go.sum missing"
+COPY backend/go.mod ./
+# go.sum may not exist in the repo yet — go mod tidy generates it from scratch
+# inside the build container (which has internet access) before compiling.
+RUN go mod tidy
 COPY backend/ ./
 RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o fluxio-backend ./cmd/server/main.go
 

@@ -1538,6 +1538,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -1551,8 +1552,15 @@ import (
 // letting us test the HTTP layer without a database.
 type fakeModeStore struct{ mode string }
 
-func (f *fakeModeStore) GetDPIMode(context.Context) (string, error)      { return f.mode, nil }
-func (f *fakeModeStore) SetDPIMode(_ context.Context, mode string) error { f.mode = mode; return nil }
+func (f *fakeModeStore) GetDPIMode(context.Context) (string, error) { return f.mode, nil }
+func (f *fakeModeStore) SetDPIMode(_ context.Context, mode string) error {
+	valid := map[string]bool{"none": true, "suricata": true, "tzsp": true}
+	if !valid[mode] {
+		return fmt.Errorf("unknown dpi_mode %q (valid: none, suricata, tzsp)", mode)
+	}
+	f.mode = mode
+	return nil
+}
 
 func TestSettingsHandlers_GetAndPut(t *testing.T) {
 	store := &fakeModeStore{mode: "none"}

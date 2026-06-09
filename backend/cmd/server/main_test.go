@@ -19,6 +19,10 @@ import (
 // letting us test the HTTP layer without a database.
 type fakeModeStore struct{ mode string }
 
+type fakeModeSwitcher struct{ mode string }
+
+func (f *fakeModeSwitcher) SetMode(_ context.Context, mode string) error { f.mode = mode; return nil }
+
 func (f *fakeModeStore) GetDPIMode(context.Context) (string, error) { return f.mode, nil }
 func (f *fakeModeStore) SetDPIMode(_ context.Context, mode string) error {
 	valid := map[string]bool{"none": true, "suricata": true, "tzsp": true}
@@ -31,8 +35,9 @@ func (f *fakeModeStore) SetDPIMode(_ context.Context, mode string) error {
 
 func TestSettingsHandlers_GetAndPut(t *testing.T) {
 	store := &fakeModeStore{mode: "none"}
+	switcher := &fakeModeSwitcher{}
 	app := fiber.New()
-	registerSettingsRoutes(app.Group("/api"), store)
+	registerSettingsRoutes(app.Group("/api"), store, switcher)
 
 	// GET returns the current mode
 	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
@@ -63,6 +68,9 @@ func TestSettingsHandlers_GetAndPut(t *testing.T) {
 	}
 	if store.mode != "suricata" {
 		t.Fatalf("expected store to be updated to %q, got %q", "suricata", store.mode)
+	}
+	if switcher.mode != "suricata" {
+		t.Fatalf("expected the live listener to be switched to %q, got %q", "suricata", switcher.mode)
 	}
 
 	// PUT with an invalid mode is rejected with 400

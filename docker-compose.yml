@@ -59,6 +59,8 @@ services:
       - GEOIP_CITY_DB=/root/geoip/GeoLite2-City.mmdb
       - GEOIP_ASN_DB=/root/geoip/GeoLite2-ASN.mmdb
       - NETFLOW_PORT=2055
+      - SURICATA_EVE_LOG_PATH=/var/log/suricata/eve.json
+      - TZSP_PORT=37008
     depends_on:
       - clickhouse
       - postgres

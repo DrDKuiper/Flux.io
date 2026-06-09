@@ -61,7 +61,40 @@ func main() {
 	}
 	defer pgDB.Close()
 	settingsRepo := settings.NewRepository(pgDB)
-	registerSettingsRoutes(api, settingsRepo)
+
+	correlationCache := processor.NewCorrelationCache(30 * time.Second)
+	go correlationCache.CleanupLoop(pipelineCtx, 10*time.Second)
+
+	eveLogPath := os.Getenv("SURICATA_EVE_LOG_PATH")
+	if eveLogPath == "" {
+		eveLogPath = "/var/log/suricata/eve.json"
+	}
+	tzspPort := os.Getenv("TZSP_PORT")
+	if tzspPort == "" {
+		tzspPort = "37008"
+	}
+
+	dpiManager := collector.NewDPIManager(correlationCache, collector.DPIManagerSources{
+		Suricata: func(ctx context.Context) {
+			collector.RunSuricataCorrelator(ctx, collector.NewFileTailer(eveLogPath), correlationCache)
+		},
+		TZSP: func(ctx context.Context) {
+			if err := collector.StartTZSPListener(tzspPort, correlationCache); err != nil {
+				log.Printf("tzsp: listener stopped: %v", err)
+			}
+		},
+	})
+
+	startupMode, err := settingsRepo.GetDPIMode(context.Background())
+	if err != nil {
+		log.Printf("Failed to read saved DPI mode, defaulting to 'none': %v", err)
+		startupMode = "none"
+	}
+	if err := dpiManager.SetMode(pipelineCtx, startupMode); err != nil {
+		log.Printf("Failed to start DPI mode %q: %v", startupMode, err)
+	}
+
+	registerSettingsRoutes(api, settingsRepo, dpiManager)
 
 	api.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok"})

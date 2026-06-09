@@ -13,7 +13,9 @@ import (
 // syslog envelope ("<PRI>TAG: MSG") so Wazuh's syslog listener accepts it
 // as a structured event. PRI 134 = facility 16 (local0) * 8 + severity 6
 // (informational), a reasonable default for forwarded IDS telemetry.
-// Embedded newlines are stripped — a single syslog message must be one line.
+// Trailing CR/LF characters are stripped — FileTailer always delivers
+// complete, newline-terminated lines and this ensures the UDP payload
+// is a single clean line.
 func formatWazuhSyslogMessage(line string) string {
 	clean := strings.TrimRight(line, "\r\n")
 	return fmt.Sprintf("<134>fluxio-suricata: %s", clean)
@@ -59,6 +61,12 @@ func RunWazuhForwarder(ctx context.Context, eveLogPath, wazuhIP, wazuhPort strin
 
 // dialWazuhWithRetry dials addr over UDP, retrying every 5s until it
 // succeeds or ctx is cancelled (in which case it returns nil).
+//
+// Note: net.Dial("udp", addr) succeeds immediately for any syntactically
+// valid address because UDP is connectionless and the kernel performs no
+// handshake at dial time. In practice this function always returns on the
+// first attempt; the retry loop is retained as a forward-looking hook for
+// a future TCP/TLS transport. Write errors are logged at the call site.
 func dialWazuhWithRetry(ctx context.Context, addr string) net.Conn {
 	for {
 		conn, err := net.Dial("udp", addr)

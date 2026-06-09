@@ -1,6 +1,9 @@
 package collector
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 const tlsEventJSON = `{"timestamp":"2026-06-08T12:00:00.000000+0000","event_type":"tls","src_ip":"10.0.0.1","src_port":51000,"dest_ip":"93.184.216.34","dest_port":443,"proto":"TCP","tls":{"sni":"example.com"}}`
 
@@ -87,5 +90,9 @@ func TestParseEveLine_Alert(t *testing.T) {
 	}
 	if alert.Signature != "ET MALWARE Possible C2 Beacon" {
 		t.Errorf("unexpected signature: %q", alert.Signature)
+	}
+	wantTS := time.Date(2026, 6, 8, 12, 0, 3, 0, time.UTC)
+	if !alert.Timestamp.Equal(wantTS) {
+		t.Errorf("expected timestamp %v, got %v", wantTS, alert.Timestamp)
 	}
 }

@@ -3,6 +3,7 @@ package collector
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -56,6 +57,9 @@ type eveHTTP struct {
 
 // ParseEveLine decodes a single line of Suricata's eve.json.
 func ParseEveLine(line string) (*EveEvent, error) {
+	if strings.TrimSpace(line) == "" {
+		return nil, fmt.Errorf("eve: empty line")
+	}
 	var evt EveEvent
 	if err := json.Unmarshal([]byte(line), &evt); err != nil {
 		return nil, fmt.Errorf("eve: failed to parse line: %w", err)
@@ -115,9 +119,13 @@ func (e *EveEvent) ToAlert() (processor.SuricataAlert, bool) {
 	if e.Alert == nil {
 		return processor.SuricataAlert{}, false
 	}
-	ts, err := time.Parse("2006-01-02T15:04:05.000000-0700", e.Timestamp)
+	ts, err := time.Parse(time.RFC3339Nano, e.Timestamp) // handles +00:00 (RFC 3339 with colon)
 	if err != nil {
-		ts = time.Now().UTC()
+		ts, err = time.Parse("2006-01-02T15:04:05.000000-0700", e.Timestamp) // handles +0000 (Suricata default)
+	}
+	if err != nil {
+		log.Printf("eve: unparseable timestamp %q: %v", e.Timestamp, err)
+		return processor.SuricataAlert{}, false
 	}
 	return processor.SuricataAlert{
 		Timestamp:       ts,

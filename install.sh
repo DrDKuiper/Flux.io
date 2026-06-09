@@ -828,20 +828,20 @@ wait_for_healthy() {
     fi
 
     # ── Step 2: wait for all compose services to reach 'running' ─────────────
+    # Use `docker ps -a` filtered by container name prefix ("fluxio-") instead of
+    # `docker compose ps` — the latter can miss containers started by systemd when
+    # the project context differs (e.g. working directory vs -f flag resolution).
     info "Waiting for all containers to reach 'running' state ..."
+    info "(Image build may take a few minutes on first run)"
     local container_attempts=0
     while true; do
-        # Run compose ps once and parse the same output — avoids multiple docker calls
-        # and prevents the grep-c || echo double-capture bug under set -euo pipefail.
-        local _ps_out _ps_lines total running exited
-        _ps_out="$(docker compose -f "${REPO_DIR}/docker-compose.yml" ps --all 2>/dev/null || true)"
-        _ps_lines="$(echo "$_ps_out" | tail -n +2 | grep -v '^$' || true)"
+        local _ps_out total running exited
+        _ps_out="$(docker ps -a --filter 'name=fluxio-' \
+                      --format '{{.Names}}\t{{.Status}}' 2>/dev/null || true)"
 
-        # grep -c returns exit 1 when count is 0; || true prevents set -e from killing us.
-        # Strip whitespace that wc -l sometimes adds on older coreutils.
-        total="$(  echo "$_ps_lines" | grep -c '.'        || true)"; total="${total//[[:space:]]/}";   total="${total:-0}"
-        running="$(echo "$_ps_lines" | grep -cE 'Up |running' || true)"; running="${running//[[:space:]]/}"; running="${running:-0}"
-        exited="$( echo "$_ps_lines" | grep -cE 'Exit|exited'  || true)"; exited="${exited//[[:space:]]/}";  exited="${exited:-0}"
+        total="$(  echo "$_ps_out" | grep -c '.'             || true)"; total="${total:-0}"
+        running="$(echo "$_ps_out" | grep -cE '\bUp\b'       || true)"; running="${running:-0}"
+        exited="$( echo "$_ps_out" | grep -cE 'Exited|Exit ' || true)"; exited="${exited:-0}"
 
         if [[ "$total" -gt 0 ]] && [[ "$running" -ge "$total" ]]; then
             success "All ${total} containers are running."
@@ -850,16 +850,35 @@ wait_for_healthy() {
 
         if [[ "$exited" -gt 0 ]]; then
             echo
-            warn "One or more containers have exited. Showing logs:"
-            docker compose -f "${REPO_DIR}/docker-compose.yml" logs --tail=30 || true
-            error "Fix the issue above."
+            warn "One or more containers exited. Last 30 log lines:"
+            docker compose -f "${REPO_DIR}/docker-compose.yml" logs --tail=30 2>/dev/null || \
+                journalctl -u fluxio --no-pager -n 30 2>/dev/null || true
+            error "Fix the errors above, then run: systemctl start fluxio"
             exit 1
         fi
 
         container_attempts=$(( container_attempts + 1 ))
-        if (( container_attempts % 15 == 0 )); then
-            info "Containers: ${running}/${total} running (${container_attempts}s elapsed)"
+
+        # Every 30 s: show a live snippet so the user can see progress (build output, pulls, etc.)
+        if (( container_attempts % 30 == 0 )); then
+            echo
+            info "Still waiting... ${container_attempts}s elapsed — ${running}/${total} containers up"
+            info "Recent service output:"
+            journalctl -u fluxio --no-pager -n 6 2>/dev/null || \
+                tail -n 6 "${LOG_DIR}/fluxio.log" 2>/dev/null || true
+            echo
         fi
+
+        # Hard timeout at 10 minutes — something is clearly stuck
+        if (( container_attempts >= 600 )); then
+            echo
+            error "Containers did not start after 10 minutes. Full service log:"
+            journalctl -u fluxio --no-pager -n 60 2>/dev/null || \
+                tail -n 60 "${LOG_DIR}/fluxio.log" 2>/dev/null || true
+            error "Try manually: cd ${REPO_DIR} && docker compose up"
+            exit 1
+        fi
+
         printf '.'
         sleep 1
     done

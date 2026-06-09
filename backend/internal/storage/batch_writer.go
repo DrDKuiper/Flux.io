@@ -38,19 +38,14 @@ func NewBatchWriter(inserter Inserter, batchSize int, flushEvery time.Duration) 
 	}
 }
 
-// WriteFlow enqueues a record for the next flush. It never blocks the caller
-// for long: if the buffer is saturated, the oldest pending record is dropped
-// so a slow database can't back-pressure the whole collection pipeline.
+// WriteFlow enqueues a record for the next flush. It never blocks the caller:
+// if the buffer is saturated the incoming record is dropped and a warning is
+// logged. This prevents a slow database from back-pressuring the collection pipeline.
 func (w *BatchWriter) WriteFlow(r processor.FlowRecord) {
 	select {
 	case w.flowCh <- r:
 	default:
-		select {
-		case <-w.flowCh:
-		default:
-		}
-		log.Printf("storage: flow buffer full, dropped oldest record to make room")
-		w.flowCh <- r
+		log.Printf("storage: flow buffer full, dropping incoming record")
 	}
 }
 
@@ -58,12 +53,7 @@ func (w *BatchWriter) WriteAlert(a processor.SuricataAlert) {
 	select {
 	case w.alertCh <- a:
 	default:
-		select {
-		case <-w.alertCh:
-		default:
-		}
-		log.Printf("storage: alert buffer full, dropped oldest record to make room")
-		w.alertCh <- a
+		log.Printf("storage: alert buffer full, dropping incoming alert")
 	}
 }
 
@@ -90,7 +80,16 @@ func (w *BatchWriter) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			flush()
+			// Use a fresh context for the final flush so in-buffer records are
+			// persisted even when the parent context is already cancelled.
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer shutdownCancel()
+			if len(flows) > 0 {
+				w.flushFlows(shutdownCtx, flows)
+			}
+			if len(alerts) > 0 {
+				w.flushAlerts(shutdownCtx, alerts)
+			}
 			return
 		case rec := <-w.flowCh:
 			flows = append(flows, rec)
@@ -129,9 +128,13 @@ func (w *BatchWriter) flushAlerts(ctx context.Context, batch []processor.Suricat
 }
 
 // insertWithRetry retries a write up to 3 times with exponential backoff
-// (200ms, 400ms, 800ms) before giving up — ClickHouse outages are usually
-// transient (restarts, brief network blips).
+// (200ms, 400ms) before giving up — ClickHouse outages are usually
+// transient (restarts, brief network blips). The final attempt does not
+// sleep so shutdown is not delayed unnecessarily.
 func (w *BatchWriter) insertWithRetry(ctx context.Context, fn func(context.Context) error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	backoff := 200 * time.Millisecond
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
@@ -140,6 +143,9 @@ func (w *BatchWriter) insertWithRetry(ctx context.Context, fn func(context.Conte
 		} else {
 			lastErr = err
 			log.Printf("storage: insert attempt %d failed: %v", attempt+1, err)
+		}
+		if attempt == 2 {
+			break // no sleep after the last attempt
 		}
 		select {
 		case <-ctx.Done():

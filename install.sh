@@ -285,6 +285,249 @@ check_all_ports() {
     _check_udp "$tzsp_port"  "TZSP"          "TZSP_PORT"
 }
 
+# ─── SELinux check & remediation ─────────────────────────────────────────────
+# Detects SELinux state and, if Enforcing, applies container file contexts to
+# every directory that will be bind-mounted into a Docker container so that
+# the daemon can read/write them without AVC denials.
+# ──────────────────────────────────────────────────────────────────────────────
+check_selinux() {
+    header "SELinux Check"
+
+    if ! command -v getenforce &>/dev/null; then
+        info "SELinux not present on this system — skipping."
+        return
+    fi
+
+    local se_status
+    se_status="$(getenforce 2>/dev/null || echo 'Unknown')"
+
+    case "$se_status" in
+        Enforcing)
+            warn "SELinux is in ${BOLD}Enforcing${RESET}${YELLOW} mode."
+            info "Applying container file contexts to Flux.io bind-mount directories..."
+
+            # Prefer the modern type; fall back to the legacy one (RHEL 7)
+            local se_type="container_file_t"
+            if command -v seinfo &>/dev/null && ! seinfo -t container_file_t &>/dev/null 2>&1; then
+                se_type="svirt_sandbox_file_t"
+            fi
+
+            local -a bind_dirs=(
+                "${REPO_DIR}/backend/geoip"
+                "${REPO_DIR}/suricata/logs"
+                "${REPO_DIR}/db/clickhouse"
+                "${REPO_DIR}/db/postgres"
+            )
+            local ctx_ok=0 ctx_fail=0
+            for dir in "${bind_dirs[@]}"; do
+                mkdir -p "$dir"
+                if chcon -Rt "${se_type}" "$dir" 2>/dev/null; then
+                    info "  ✓ chcon -Rt ${se_type} ${dir}"
+                    (( ctx_ok++ )) || true
+                else
+                    warn "  ✗ Could not relabel ${dir} — volume mount may fail."
+                    (( ctx_fail++ )) || true
+                fi
+            done
+
+            # Enable booleans required for Docker networking and cgroup access
+            local -a se_bools=(container_manage_cgroup container_use_devices)
+            for bool in "${se_bools[@]}"; do
+                setsebool -P "$bool" 1 2>/dev/null && \
+                    info "  ✓ setsebool -P ${bool} 1" || \
+                    warn "  ✗ Could not set ${bool} (may not exist on this policy version)"
+            done
+
+            if (( ctx_fail == 0 )); then
+                success "SELinux contexts applied (${ctx_ok} directories relabelled, type: ${se_type})."
+            else
+                warn "${ctx_fail} directories could not be relabelled. If containers log 'Permission denied', run:"
+                warn "  chcon -Rt container_file_t ${REPO_DIR}"
+            fi
+            ;;
+        Permissive)
+            warn "SELinux is Permissive — not blocking, but writing denials to audit.log."
+            info "Check for issues post-install: ausearch -m avc -ts recent | audit2why"
+            ;;
+        Disabled)
+            success "SELinux is disabled — no action needed."
+            ;;
+        *)
+            warn "Unexpected getenforce output: '${se_status}'. Continuing."
+            ;;
+    esac
+}
+
+# ─── Firewall check & auto-configuration ──────────────────────────────────────
+# Detects the active firewall manager (firewalld, ufw, nftables, iptables) and
+# checks whether the external-facing Flux.io ports are allowed through.
+#
+# Ports that need to be reachable from outside the host:
+#   TCP  PORT         Dashboard + REST API
+#   UDP  NETFLOW_PORT NetFlow v9 / IPFIX from routers / switches
+#   UDP  TZSP_PORT    TZSP-mirrored packet traffic from switches
+#
+# Docker-internal ports (ClickHouse 8123/9000, Postgres 5432) are NOT opened —
+# they are only reachable inside the Docker bridge network.
+# ──────────────────────────────────────────────────────────────────────────────
+_fw_type=""
+
+_detect_firewall() {
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        _fw_type="firewalld"
+    elif command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        _fw_type="ufw"
+    elif systemctl is-active --quiet nftables 2>/dev/null && command -v nft &>/dev/null; then
+        _fw_type="nftables"
+    elif command -v iptables &>/dev/null && \
+         iptables -L INPUT -n 2>/dev/null | grep -qv "^Chain\|^target\|^$"; then
+        _fw_type="iptables"
+    else
+        _fw_type="none"
+    fi
+}
+
+_fw_port_open() {
+    local proto="$1" port="$2"
+    case "$_fw_type" in
+        firewalld) firewall-cmd --query-port="${port}/${proto}" --zone=public &>/dev/null ;;
+        ufw)       ufw status 2>/dev/null | grep -qE "^${port}/(${proto}|any)[[:space:]]+ALLOW" ;;
+        nftables)  nft list ruleset 2>/dev/null | grep -qE "${proto}[[:space:]]+dport[[:space:]]+${port}[[:space:]]+accept" ;;
+        iptables)  iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT &>/dev/null ;;
+        *)         return 0 ;;  # no firewall — assume open
+    esac
+}
+
+_fw_open_port() {
+    local proto="$1" port="$2"
+    case "$_fw_type" in
+        firewalld)
+            firewall-cmd --add-port="${port}/${proto}" --zone=public --permanent
+            ;;
+        ufw)
+            ufw allow "${port}/${proto}"
+            ;;
+        nftables)
+            # nft rule is version-dependent; emit manual command and return
+            warn "nftables: add manually → nft add rule inet filter input ${proto} dport ${port} accept"
+            return 1
+            ;;
+        iptables)
+            iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT
+            # Persist depending on what's available
+            if [[ -d /etc/iptables ]]; then
+                iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            elif command -v service &>/dev/null; then
+                service iptables save 2>/dev/null || true
+            fi
+            ;;
+    esac
+}
+
+_fw_reload() {
+    case "$_fw_type" in
+        firewalld) firewall-cmd --reload ;;
+        ufw)       ufw reload ;;
+        *)         ;; # iptables / nftables — rules take effect immediately
+    esac
+}
+
+_fw_print_manual() {
+    local http_port="$1" nf_port="$2" tzsp_port="$3"
+    case "$_fw_type" in
+        firewalld)
+            echo "  firewall-cmd --add-port=${http_port}/tcp --permanent && \\"
+            echo "  firewall-cmd --add-port=${nf_port}/udp  --permanent && \\"
+            echo "  firewall-cmd --add-port=${tzsp_port}/udp --permanent && \\"
+            echo "  firewall-cmd --reload"
+            ;;
+        ufw)
+            echo "  ufw allow ${http_port}/tcp"
+            echo "  ufw allow ${nf_port}/udp"
+            echo "  ufw allow ${tzsp_port}/udp"
+            ;;
+        nftables)
+            echo "  nft add rule inet filter input tcp dport ${http_port} accept"
+            echo "  nft add rule inet filter input udp dport ${nf_port}  accept"
+            echo "  nft add rule inet filter input udp dport ${tzsp_port} accept"
+            ;;
+        iptables)
+            echo "  iptables -I INPUT -p tcp --dport ${http_port} -j ACCEPT"
+            echo "  iptables -I INPUT -p udp --dport ${nf_port}  -j ACCEPT"
+            echo "  iptables -I INPUT -p udp --dport ${tzsp_port} -j ACCEPT"
+            ;;
+    esac
+}
+
+check_firewall() {
+    header "Firewall Check"
+    _detect_firewall
+
+    if [[ "$_fw_type" == "none" ]]; then
+        info "No active firewall detected — skipping."
+        return
+    fi
+
+    success "Active firewall: ${BOLD}${_fw_type}${RESET}"
+    echo
+
+    local http_port nf_port tzsp_port
+    http_port="$(_env_val PORT)"
+    nf_port="$(_env_val NETFLOW_PORT)"
+    tzsp_port="$(_env_val TZSP_PORT)"
+
+    # Print status table
+    printf "  %-6s %-8s %-26s %s\n" "Proto" "Port" "Purpose" "Status"
+    printf "  %-6s %-8s %-26s %s\n" "─────" "──────" "────────────────────────" "──────"
+
+    local needs_action=0
+    local -a checks=(
+        "tcp:${http_port}:Dashboard / REST API"
+        "udp:${nf_port}:NetFlow v9 / IPFIX"
+        "udp:${tzsp_port}:TZSP mirror traffic"
+    )
+    for spec in "${checks[@]}"; do
+        IFS=: read -r proto port label <<< "$spec"
+        if _fw_port_open "$proto" "$port"; then
+            printf "  ${GREEN}✅${RESET}  %-6s %-8s %-26s ${GREEN}open${RESET}\n" \
+                "$proto" "$port" "$label"
+        else
+            printf "  ${YELLOW}⚠️ ${RESET}  %-6s %-8s %-26s ${YELLOW}BLOCKED${RESET}\n" \
+                "$proto" "$port" "$label"
+            needs_action=1
+        fi
+    done
+    echo
+
+    if (( needs_action == 0 )); then
+        success "All required ports are open."
+        return
+    fi
+
+    read -rp "Open blocked ports automatically via ${_fw_type}? [Y/n]: " fw_choice
+    fw_choice="${fw_choice:-Y}"
+    if [[ "${fw_choice^^}" != "Y" ]]; then
+        warn "Skipping. Open ports manually:"
+        _fw_print_manual "$http_port" "$nf_port" "$tzsp_port"
+        return
+    fi
+
+    info "Configuring ${_fw_type} rules..."
+    local fw_ok=1
+    _fw_open_port "tcp" "$http_port"  && success "Opened TCP ${http_port}  (Dashboard / API)"  || { warn "Failed TCP ${http_port}";  fw_ok=0; }
+    _fw_open_port "udp" "$nf_port"   && success "Opened UDP ${nf_port}   (NetFlow)"            || { warn "Failed UDP ${nf_port}";   fw_ok=0; }
+    _fw_open_port "udp" "$tzsp_port" && success "Opened UDP ${tzsp_port} (TZSP)"               || { warn "Failed UDP ${tzsp_port}"; fw_ok=0; }
+
+    if (( fw_ok == 1 )); then
+        _fw_reload && success "${_fw_type} reloaded — rules are active." || \
+            warn "Reload returned non-zero; rules may need a manual reload."
+    else
+        warn "Some ports could not be opened. See warnings above."
+        warn "Manual commands:"
+        _fw_print_manual "$http_port" "$nf_port" "$tzsp_port"
+    fi
+}
+
 # ─── Dev toolchain ────────────────────────────────────────────────────────────
 install_go() {
     if command -v go &>/dev/null && go version 2>/dev/null | grep -qE "go1\.22\.[0-9]+"; then
@@ -642,6 +885,130 @@ wait_for_healthy() {
     echo
 }
 
+# ─── Post-startup service verification ───────────────────────────────────────
+# Runs after wait_for_healthy and performs a final structured audit:
+#   1. Container status table (name, state, port mappings)
+#   2. GeoIP database presence and size
+#   3. HTTP health endpoint
+#   4. Listening port verification (TCP confirmed; UDP advisory)
+#   5. Docker volume inventory
+# Prints a single PASS / WARN banner at the end.
+# ──────────────────────────────────────────────────────────────────────────────
+verify_services() {
+    header "Service Verification"
+
+    local all_ok=1
+
+    # ── 1. Container status table ─────────────────────────────────────────────
+    echo -e "  ${BOLD}Containers:${RESET}"
+    printf "  %-5s %-28s %-12s %s\n" "" "Name" "State" "Ports"
+    printf "  %-5s %-28s %-12s %s\n" "" "────────────────────────────" "──────────" "──────────────────────────"
+
+    local container_ok=0 container_fail=0
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        # Compose v2: NAME  IMAGE  COMMAND  SERVICE  CREATED  STATUS  PORTS
+        local cname cstatus cports
+        cname="$(   echo "$line" | awk '{print $1}')"
+        # STATUS column varies: "Up 2 minutes", "running", "Exited (1) 2 minutes ago"
+        if echo "$line" | grep -qiE '\bUp\b|\brunning\b'; then
+            cstatus="${GREEN}running${RESET}"
+            # Extract port mappings (last field cluster) — simplified
+            cports="$(echo "$line" | grep -oE '0\.0\.0\.0:[0-9]+->[0-9]+/(tcp|udp)' | head -3 | tr '\n' ' ')"
+            [[ -z "$cports" ]] && cports="(internal / host network)"
+            printf "  ${GREEN}✅${RESET}  %-28s %-22b %s\n" "$cname" "$cstatus" "$cports"
+            (( container_ok++  )) || true
+        else
+            cstatus="${RED}$(echo "$line" | awk '{print $6,$7,$8}' | sed 's/[[:space:]]*$//')${RESET}"
+            printf "  ${RED}✗${RESET}   %-28s %-22b\n" "$cname" "$cstatus"
+            (( container_fail++ )) || true
+            all_ok=0
+        fi
+    done < <(docker compose -f "${REPO_DIR}/docker-compose.yml" ps --all 2>/dev/null | tail -n +2)
+
+    if (( container_ok == 0 && container_fail == 0 )); then
+        warn "No containers found. Is the Compose project running?"
+        all_ok=0
+    fi
+    echo
+
+    # ── 2. GeoIP databases ────────────────────────────────────────────────────
+    echo -e "  ${BOLD}GeoIP databases:${RESET}"
+    for db in GeoLite2-City GeoLite2-ASN; do
+        local dbpath="${REPO_DIR}/backend/geoip/${db}.mmdb"
+        if [[ -f "$dbpath" ]]; then
+            printf "  ${GREEN}✅${RESET}  %-24s %s\n" "${db}.mmdb" "($(du -h "$dbpath" | cut -f1))"
+        else
+            printf "  ${YELLOW}⚠️ ${RESET}  %-24s not found — GeoIP enrichment disabled\n" "${db}.mmdb"
+        fi
+    done
+    echo
+
+    # ── 3. HTTP health endpoint ───────────────────────────────────────────────
+    local http_port
+    http_port="$(_env_val PORT)"
+    echo -e "  ${BOLD}API:${RESET}"
+    local hcode
+    hcode="$(curl -o /dev/null -sw '%{http_code}' --max-time 5 \
+                "http://127.0.0.1:${http_port}/api/health" 2>/dev/null || echo 000)"
+    if [[ "$hcode" == "200" ]]; then
+        printf "  ${GREEN}✅${RESET}  GET /api/health → HTTP 200\n"
+    else
+        printf "  ${RED}✗${RESET}   GET /api/health → HTTP %s\n" "$hcode"
+        all_ok=0
+    fi
+    echo
+
+    # ── 4. Port binding verification ──────────────────────────────────────────
+    local nf_port tzsp_port
+    nf_port="$(_env_val NETFLOW_PORT)"
+    tzsp_port="$(_env_val TZSP_PORT)"
+    echo -e "  ${BOLD}Port bindings:${RESET}"
+    printf "  %-5s %-6s %-8s %s\n" "" "Proto" "Port" "Purpose"
+    printf "  %-5s %-6s %-8s %s\n" "" "─────" "──────" "──────────────────────"
+
+    # TCP ports are verifiable via ss/netstat
+    if _port_in_use_tcp "$http_port"; then
+        printf "  ${GREEN}✅${RESET}  %-6s %-8s Dashboard / API\n" "tcp" "$http_port"
+    else
+        printf "  ${RED}✗${RESET}   %-6s %-8s ${RED}NOT listening${RESET} — backend may have failed\n" "tcp" "$http_port"
+        all_ok=0
+    fi
+
+    # UDP sockets only appear in ss when actively bound; advisory only
+    for udp_spec in "${nf_port}:NetFlow v9 / IPFIX" "${tzsp_port}:TZSP mirror"; do
+        IFS=: read -r uport ulabel <<< "$udp_spec"
+        if _port_in_use_udp "$uport"; then
+            printf "  ${GREEN}✅${RESET}  %-6s %-8s %s\n" "udp" "$uport" "$ulabel"
+        else
+            printf "  ${YELLOW}⚠️ ${RESET}  %-6s %-8s %s — socket not yet visible (normal until first packet)\n" \
+                "udp" "$uport" "$ulabel"
+        fi
+    done
+    echo
+
+    # ── 5. Docker volumes ─────────────────────────────────────────────────────
+    echo -e "  ${BOLD}Docker volumes:${RESET}"
+    local vol_count=0
+    while IFS= read -r vol; do
+        printf "  ${GREEN}✅${RESET}  %s\n" "$vol"
+        (( vol_count++ )) || true
+    done < <(docker volume ls --filter "name=fluxio" --format "{{.Name}}" 2>/dev/null)
+    (( vol_count == 0 )) && warn "No named volumes found — data may not be persisted."
+    echo
+
+    # ── Summary banner ────────────────────────────────────────────────────────
+    if (( all_ok == 1 )); then
+        success "${BOLD}All checks passed — Flux.io is fully operational.${RESET}"
+    else
+        warn "${BOLD}Some checks failed.${RESET} Review the output above."
+        warn "Diagnostics:"
+        warn "  docker compose logs --tail=50"
+        warn "  journalctl -u fluxio -n 50 --no-pager"
+        warn "  cat ${LOG_DIR}/fluxio.log | tail -50"
+    fi
+}
+
 # ─── Summary screen ───────────────────────────────────────────────────────────
 print_summary() {
     local host_ip
@@ -703,6 +1070,8 @@ main() {
     select_mode
     run_wizard
     check_all_ports
+    check_selinux
+    check_firewall
 
     if [[ "$INSTALL_MODE" == "development" ]]; then
         header "Dev Toolchain"
@@ -733,6 +1102,8 @@ main() {
 
     # Block here until the full stack is confirmed healthy.
     wait_for_healthy
+    # Structured post-startup audit.
+    verify_services
     print_summary
 }
 

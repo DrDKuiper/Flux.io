@@ -781,6 +781,25 @@ EOF
     success "Service logs: ${LOG_DIR}/fluxio.log  (also: journalctl -u fluxio -f)"
 }
 
+# ─── Service failure diagnostic helper ───────────────────────────────────────
+_show_service_failure() {
+    echo
+    warn "── journalctl (last 20 lines) ──────────────────────────────────"
+    journalctl -u fluxio --no-pager -n 20 2>/dev/null || true
+    echo
+    if [[ -f "${LOG_DIR}/fluxio.log" ]]; then
+        warn "── ${LOG_DIR}/fluxio.log (last 40 lines) ──────────────────────"
+        tail -n 40 "${LOG_DIR}/fluxio.log" 2>/dev/null || true
+        echo
+    fi
+    warn "── docker compose up (dry-run to expose errors) ────────────────"
+    cd "${REPO_DIR}" && docker compose config --quiet 2>&1 | head -20 || true
+    echo
+    error "Fix the errors above, then run:"
+    error "  cd ${REPO_DIR} && docker compose up"
+    error "  (or: systemctl start fluxio)"
+}
+
 # ─── Health check — waits until everything is truly running ──────────────────
 # Strategy (production):
 #   1. Wait for the systemd service to reach 'active' state.
@@ -800,26 +819,46 @@ wait_for_healthy() {
     local health_url="http://127.0.0.1:${http_port}/api/health"
 
     # ── Step 1 (production only): wait for systemd service to become active ──
+    # We require stability: the service must stay "active" for 3 consecutive
+    # checks (3 s apart) before we proceed. This catches restart loops where
+    # systemd briefly reports "active" between restart attempts.
     if [[ "${INSTALL_MODE}" == "production" ]]; then
-        info "Waiting for fluxio.service to become active ..."
-        local svc_attempts=0
+        info "Waiting for fluxio.service to become active and stable ..."
+        local svc_attempts=0 stable=0
         while true; do
-            local svc_state
+            local svc_state nrestarts
             svc_state="$(systemctl is-active fluxio 2>/dev/null || true)"
-            if [[ "$svc_state" == "active" ]]; then
-                success "fluxio.service is active."
-                break
-            elif [[ "$svc_state" == "failed" ]]; then
-                error "fluxio.service failed to start."
+            nrestarts="$(systemctl show fluxio --property=NRestarts --value 2>/dev/null || echo 0)"
+            nrestarts="${nrestarts//[[:space:]]/}"; nrestarts="${nrestarts:-0}"
+
+            if [[ "$svc_state" == "failed" ]]; then
                 echo
-                journalctl -u fluxio --no-pager -n 30 || true
-                error "Fix the issue above and run: systemctl start fluxio"
+                error "fluxio.service failed to start."
+                _show_service_failure
                 exit 1
             fi
+
+            # Restart loop detection: if docker compose keeps crashing we bail early
+            if [[ "$nrestarts" -gt 5 ]]; then
+                echo
+                error "fluxio.service is in a restart loop (${nrestarts} restarts)."
+                _show_service_failure
+                exit 1
+            fi
+
+            if [[ "$svc_state" == "active" ]]; then
+                stable=$(( stable + 1 ))
+                if [[ "$stable" -ge 3 ]]; then
+                    success "fluxio.service is active and stable."
+                    break
+                fi
+            else
+                stable=0
+            fi
+
             svc_attempts=$(( svc_attempts + 1 ))
             if (( svc_attempts % 10 == 0 )); then
-                info "Still waiting for systemd service... (${svc_attempts}s elapsed)"
-                info "Live logs: journalctl -u fluxio -f"
+                info "Still waiting for systemd service... (${svc_attempts}s, state=${svc_state}, restarts=${nrestarts})"
             fi
             printf '.'
             sleep 1
@@ -859,23 +898,34 @@ wait_for_healthy() {
 
         container_attempts=$(( container_attempts + 1 ))
 
-        # Every 30 s: show a live snippet so the user can see progress (build output, pulls, etc.)
+        # Every 30 s: show a live snippet so the user can see progress (build, pulls, etc.)
         if (( container_attempts % 30 == 0 )); then
             echo
-            info "Still waiting... ${container_attempts}s elapsed — ${running}/${total} containers up"
-            info "Recent service output:"
-            journalctl -u fluxio --no-pager -n 6 2>/dev/null || \
-                tail -n 6 "${LOG_DIR}/fluxio.log" 2>/dev/null || true
+            local _nrestarts
+            _nrestarts="$(systemctl show fluxio --property=NRestarts --value 2>/dev/null || echo 0)"
+            _nrestarts="${_nrestarts//[[:space:]]/}"; _nrestarts="${_nrestarts:-0}"
+
+            info "Still waiting... ${container_attempts}s elapsed — ${running}/${total} containers up (service restarts: ${_nrestarts})"
+
+            # Bail out early if the service is in a restart loop
+            if [[ "${_nrestarts}" -gt 5 ]]; then
+                echo
+                error "fluxio.service is in a restart loop (${_nrestarts} restarts). docker compose up is failing."
+                _show_service_failure
+                exit 1
+            fi
+
+            info "Recent docker compose output (${LOG_DIR}/fluxio.log):"
+            tail -n 10 "${LOG_DIR}/fluxio.log" 2>/dev/null || \
+                journalctl -u fluxio --no-pager -n 10 2>/dev/null || true
             echo
         fi
 
         # Hard timeout at 10 minutes — something is clearly stuck
         if (( container_attempts >= 600 )); then
             echo
-            error "Containers did not start after 10 minutes. Full service log:"
-            journalctl -u fluxio --no-pager -n 60 2>/dev/null || \
-                tail -n 60 "${LOG_DIR}/fluxio.log" 2>/dev/null || true
-            error "Try manually: cd ${REPO_DIR} && docker compose up"
+            error "Containers did not start after 10 minutes."
+            _show_service_failure
             exit 1
         fi
 

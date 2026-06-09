@@ -9,6 +9,11 @@ GO_VERSION="1.22.4"
 NODE_VERSION="20"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SYSTEMD_UNIT="/etc/systemd/system/fluxio.service"
+GEOIP_UPDATE_BIN="/usr/local/bin/fluxio-geoip-update"
+GEOIP_UPDATE_SVC="/etc/systemd/system/fluxio-geoip-update.service"
+GEOIP_UPDATE_TMR="/etc/systemd/system/fluxio-geoip-update.timer"
+LOG_DIR="/var/log/fluxio"
+INSTALL_LOG="${LOG_DIR}/install.log"
 
 # ─── Colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -23,6 +28,17 @@ success() { echo -e "${GREEN}  ✅${RESET} $*"; }
 warn()    { echo -e "${YELLOW}  ⚠️ ${RESET}  $*"; }
 error()   { echo -e "${RED}  ✗${RESET} $*" >&2; }
 header()  { echo -e "\n${BOLD}${CYAN}=== $* ===${RESET}\n"; }
+
+# ─── Logging to /var/log/fluxio/install.log ───────────────────────────────────
+setup_logging() {
+    mkdir -p "${LOG_DIR}"
+    chmod 750 "${LOG_DIR}"
+    # Tee everything (stdout + stderr) into the install log.
+    # The file descriptor dance keeps colours on the terminal while the log
+    # file stores plain text (strip ANSI via sed).
+    exec > >(tee >(sed 's/\x1B\[[0-9;]*[mK]//g' >> "${INSTALL_LOG}")) 2>&1
+    info "Install log: ${INSTALL_LOG}"
+}
 
 # ─── Privilege check ──────────────────────────────────────────────────────────
 check_root() {
@@ -100,9 +116,9 @@ ensure_docker_running() {
     else
         info "Installing Docker Compose plugin..."
         case "$PKG_FAMILY" in
-            debian)   apt-get install -y docker-compose-plugin ;;
+            debian)      apt-get install -y docker-compose-plugin ;;
             rhel|fedora) "$PKG_MGR" install -y docker-compose-plugin ;;
-            arch)     pacman -S --noconfirm docker-compose ;;
+            arch)        pacman -S --noconfirm docker-compose ;;
         esac
         success "Docker Compose plugin installed."
     fi
@@ -327,42 +343,163 @@ install_node() {
     success "Node installed: $(node --version)"
 }
 
-# ─── GeoIP download (production, optional) ───────────────────────────────────
+# ─── GeoIP download ───────────────────────────────────────────────────────────
+# Downloads GeoLite2 databases from a trusted public GitHub mirror
+# (P3TERX/GeoLite.mmdb — updated every week directly from MaxMind).
+# No API key or MaxMind account required.
+#
+# Mirror: https://github.com/P3TERX/GeoLite.mmdb
+# Fallback: https://github.com/aleskxyz/maxmind-geolite2-mirror
+# ──────────────────────────────────────────────────────────────────────────────
+GEOIP_MIRRORS=(
+    "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download"
+    "https://github.com/aleskxyz/maxmind-geolite2-mirror/releases/latest/download"
+)
+
+_download_mmdb() {
+    local db="$1"          # e.g. GeoLite2-City
+    local dest="$2"        # destination path
+    local filename="${db}.mmdb"
+
+    for mirror in "${GEOIP_MIRRORS[@]}"; do
+        info "Trying mirror: ${mirror}/${filename} ..."
+        if curl -fsSL --retry 3 --retry-delay 2 \
+               "${mirror}/${filename}" -o "${dest}"; then
+            # Validate it's actually an mmdb file (magic bytes: 0xABCDEF)
+            if file "${dest}" 2>/dev/null | grep -qi "data\|mmdb\|binary"; then
+                success "${filename} downloaded ($(du -h "${dest}" | cut -f1))"
+                return 0
+            else
+                warn "Downloaded file from ${mirror} does not look like a valid .mmdb — trying next mirror."
+                rm -f "${dest}"
+            fi
+        else
+            warn "Mirror ${mirror} failed — trying next."
+        fi
+    done
+
+    warn "All mirrors failed for ${filename}. GeoIP enrichment will be disabled until the file is present."
+    return 1
+}
+
 download_geoip() {
-    header "GeoIP Enrichment (optional)"
-    read -rp "Download MaxMind GeoLite2 databases for GeoIP/ASN enrichment? [y/N]: " geoip_choice
-    geoip_choice="${geoip_choice:-N}"
+    header "GeoIP Enrichment"
+    echo "  Databases are downloaded from a trusted public mirror (no API key needed)."
+    echo "  Source: https://github.com/P3TERX/GeoLite.mmdb (updated weekly from MaxMind)"
+    echo
+    read -rp "Download GeoLite2 databases now? [Y/n]: " geoip_choice
+    geoip_choice="${geoip_choice:-Y}"
     if [[ "${geoip_choice^^}" != "Y" ]]; then
         warn "GeoIP skipped. Add GeoLite2-City.mmdb and GeoLite2-ASN.mmdb to backend/geoip/ to enable enrichment."
         return
     fi
 
-    read -rsp "MaxMind license key: " maxmind_key
-    echo
-    if [[ -z "$maxmind_key" ]]; then
-        warn "No license key provided. Skipping GeoIP download."
-        return
-    fi
-
     mkdir -p "${REPO_DIR}/backend/geoip"
 
-    local base_url="https://download.maxmind.com/app/geoip_download"
-    for db in GeoLite2-City GeoLite2-ASN; do
-        info "Downloading ${db}.mmdb ..."
-        local tgz="/tmp/${db}.tar.gz"
-        if curl -fsSL \
-            "${base_url}?edition_id=${db}&license_key=${maxmind_key}&suffix=tar.gz" \
-            -o "$tgz"; then
-            local mmdb_path
-            mmdb_path="$(tar -tzf "$tgz" | grep '\.mmdb$' | head -1)"
-            tar -xzf "$tgz" -C /tmp "${mmdb_path}"
-            mv "/tmp/${mmdb_path}" "${REPO_DIR}/backend/geoip/${db}.mmdb"
-            rm -rf "$tgz" "/tmp/$(dirname "$mmdb_path")"
-            success "${db}.mmdb saved to backend/geoip/"
-        else
-            warn "Failed to download ${db}.mmdb. GeoIP enrichment will be disabled for this database."
+    local ok=0
+    _download_mmdb "GeoLite2-City" "${REPO_DIR}/backend/geoip/GeoLite2-City.mmdb" && ok=$(( ok + 1 )) || true
+    _download_mmdb "GeoLite2-ASN"  "${REPO_DIR}/backend/geoip/GeoLite2-ASN.mmdb"  && ok=$(( ok + 1 )) || true
+
+    if (( ok == 2 )); then
+        success "Both GeoIP databases ready in backend/geoip/"
+    elif (( ok == 1 )); then
+        warn "Only one GeoIP database was downloaded. Enrichment will be partial."
+    else
+        warn "No GeoIP databases were downloaded. Enrichment will be disabled."
+    fi
+}
+
+# ─── GeoIP auto-updater (systemd timer) ───────────────────────────────────────
+# Creates:
+#   /usr/local/bin/fluxio-geoip-update   — standalone update script
+#   fluxio-geoip-update.service          — oneshot, runs the script
+#   fluxio-geoip-update.timer            — fires every week on Sunday 03:00
+# Then enables the timer and runs the first update immediately.
+# ──────────────────────────────────────────────────────────────────────────────
+install_geoip_updater() {
+    info "Installing weekly GeoIP auto-updater ..."
+
+    # ── Update script ──
+    cat > "${GEOIP_UPDATE_BIN}" <<SCRIPT
+#!/usr/bin/env bash
+# Flux.io GeoIP updater — managed by fluxio-geoip-update.timer
+# Do not edit directly; re-run install.sh to regenerate.
+set -euo pipefail
+
+GEOIP_DIR="${REPO_DIR}/backend/geoip"
+LOG_FILE="${LOG_DIR}/geoip-update.log"
+MIRRORS=(
+    "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download"
+    "https://github.com/aleskxyz/maxmind-geolite2-mirror/releases/latest/download"
+)
+
+mkdir -p "\${GEOIP_DIR}" "${LOG_DIR}"
+exec >> "\${LOG_FILE}" 2>&1
+echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Starting GeoIP update ..."
+
+download_db() {
+    local db="\$1"
+    local dest="\${GEOIP_DIR}/\${db}.mmdb"
+    local tmp="\${dest}.tmp"
+
+    for mirror in "\${MIRRORS[@]}"; do
+        if curl -fsSL --retry 3 --retry-delay 5 "\${mirror}/\${db}.mmdb" -o "\${tmp}"; then
+            mv "\${tmp}" "\${dest}"
+            echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \${db}.mmdb updated (mirror: \${mirror})"
+            return 0
         fi
+        echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Mirror \${mirror} failed for \${db}.mmdb"
+        rm -f "\${tmp}"
     done
+
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] WARNING: All mirrors failed for \${db}.mmdb"
+    return 1
+}
+
+download_db "GeoLite2-City" || true
+download_db "GeoLite2-ASN"  || true
+echo "[\$(date '+%Y-%m-%d %H:%M:%S')] GeoIP update complete."
+SCRIPT
+    chmod +x "${GEOIP_UPDATE_BIN}"
+
+    # ── systemd service (oneshot) ──
+    cat > "${GEOIP_UPDATE_SVC}" <<EOF
+[Unit]
+Description=Flux.io GeoIP database update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${GEOIP_UPDATE_BIN}
+StandardOutput=append:${LOG_DIR}/geoip-update.log
+StandardError=append:${LOG_DIR}/geoip-update.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # ── systemd timer (every Sunday at 03:00) ──
+    cat > "${GEOIP_UPDATE_TMR}" <<EOF
+[Unit]
+Description=Weekly GeoIP database update for Flux.io
+
+[Timer]
+OnCalendar=Sun *-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable fluxio-geoip-update.timer
+    systemctl start  fluxio-geoip-update.timer
+
+    success "GeoIP auto-updater installed (fires every Sunday 03:00)."
+    success "Update logs: ${LOG_DIR}/geoip-update.log"
+    success "Manual update: systemctl start fluxio-geoip-update.service"
 }
 
 # ─── systemd service (production) ────────────────────────────────────────────
@@ -388,6 +525,8 @@ ExecStart=${compose_cmd} up
 ExecStop=${compose_cmd} down
 Restart=on-failure
 RestartSec=10
+StandardOutput=append:${LOG_DIR}/fluxio.log
+StandardError=append:${LOG_DIR}/fluxio.log
 
 [Install]
 WantedBy=multi-user.target
@@ -396,25 +535,111 @@ EOF
     systemctl daemon-reload
     systemctl enable --now fluxio
     success "fluxio.service installed and enabled. Check status: systemctl status fluxio"
+    success "Service logs: ${LOG_DIR}/fluxio.log  (also: journalctl -u fluxio -f)"
 }
 
-# ─── Health check ────────────────────────────────────────────────────────────
+# ─── Health check — waits until everything is truly running ──────────────────
+# Strategy (production):
+#   1. Wait for the systemd service to reach 'active' state.
+#   2. Wait for all Docker Compose services to report 'running'.
+#   3. Poll /api/health until it returns HTTP 200.
+#
+# Strategy (development):
+#   1. Wait for all Docker Compose services to report 'running'.
+#   2. Poll /api/health until it returns HTTP 200.
+#
+# There is no hard exit timeout — the installer only prints the success banner
+# once the stack is genuinely healthy. The user can abort with Ctrl-C at any time.
+# ──────────────────────────────────────────────────────────────────────────────
 wait_for_healthy() {
     local http_port
     http_port="$(_env_val PORT)"
-    local url="http://127.0.0.1:${http_port}/api/health"
-    info "Waiting for Flux.io to be ready at ${url} ..."
-    local attempts=0
-    while (( attempts < 30 )); do
-        if curl -fsS "$url" &>/dev/null; then
-            success "Flux.io is healthy."
+    local health_url="http://127.0.0.1:${http_port}/api/health"
+
+    # ── Step 1 (production only): wait for systemd service to become active ──
+    if [[ "${INSTALL_MODE}" == "production" ]]; then
+        info "Waiting for fluxio.service to become active ..."
+        local svc_attempts=0
+        while true; do
+            local svc_state
+            svc_state="$(systemctl is-active fluxio 2>/dev/null || true)"
+            if [[ "$svc_state" == "active" ]]; then
+                success "fluxio.service is active."
+                break
+            elif [[ "$svc_state" == "failed" ]]; then
+                error "fluxio.service failed to start."
+                echo
+                journalctl -u fluxio --no-pager -n 30 || true
+                error "Fix the issue above and run: systemctl start fluxio"
+                exit 1
+            fi
+            (( svc_attempts++ ))
+            if (( svc_attempts % 10 == 0 )); then
+                info "Still waiting for systemd service... (${svc_attempts}s elapsed)"
+                info "Live logs: journalctl -u fluxio -f"
+            fi
+            printf '.'
+            sleep 1
+        done
+        echo
+    fi
+
+    # ── Step 2: wait for all compose services to reach 'running' ─────────────
+    info "Waiting for all containers to reach 'running' state ..."
+    local container_attempts=0
+    while true; do
+        local total running exited
+        # Count containers by status — compose ps --format json requires v2.17+,
+        # so we use the plain text output which is universally available.
+        total=$(docker compose -f "${REPO_DIR}/docker-compose.yml" ps --all 2>/dev/null \
+                | tail -n +2 | grep -v '^$' | wc -l || echo 0)
+        running=$(docker compose -f "${REPO_DIR}/docker-compose.yml" ps 2>/dev/null \
+                | tail -n +2 | grep -v '^$' | grep -c ' Up \| running' || echo 0)
+        exited=$(docker compose -f "${REPO_DIR}/docker-compose.yml" ps --all 2>/dev/null \
+                | tail -n +2 | grep -c ' Exit\| exited' || echo 0)
+
+        if (( total > 0 )) && (( running >= total )); then
+            success "All ${total} containers are running."
+            break
+        fi
+
+        if (( exited > 0 )); then
+            warn "One or more containers have exited. Showing logs:"
+            docker compose -f "${REPO_DIR}/docker-compose.yml" logs --tail=30 || true
+            error "Fix the issue above."
+            exit 1
+        fi
+
+        (( container_attempts++ ))
+        if (( container_attempts % 15 == 0 )); then
+            info "Containers: ${running}/${total} running (${container_attempts}s elapsed)"
+        fi
+        printf '.'
+        sleep 1
+    done
+    echo
+
+    # ── Step 3: poll the health endpoint ─────────────────────────────────────
+    info "Waiting for Flux.io API to be ready at ${health_url} ..."
+    local api_attempts=0
+    while true; do
+        local http_status
+        http_status="$(curl -o /dev/null -sw '%{http_code}' --max-time 3 \
+                        "${health_url}" 2>/dev/null || echo 000)"
+        if [[ "$http_status" == "200" ]]; then
+            success "Flux.io is healthy (HTTP 200)."
             return
         fi
-        (( attempts++ ))
-        sleep 2
+
+        (( api_attempts++ ))
+        if (( api_attempts % 15 == 0 )); then
+            info "API not ready yet (HTTP ${http_status}, ${api_attempts}s elapsed)"
+            info "Container logs: docker compose logs --tail=20 backend"
+        fi
+        printf '.'
+        sleep 1
     done
-    warn "Flux.io did not respond at ${url} within 60 seconds."
-    warn "Check container logs: docker compose logs --tail=30"
+    echo
 }
 
 # ─── Summary screen ───────────────────────────────────────────────────────────
@@ -438,11 +663,21 @@ print_summary() {
     echo -e "  NetFlow   : UDP ${host_ip}:${nf_port}"
     echo -e "  TZSP      : UDP ${host_ip}:${tzsp_port}"
     echo
+    echo "Logs:"
+    echo "  Install log  : ${INSTALL_LOG}"
+    echo "  Service log  : ${LOG_DIR}/fluxio.log"
+    echo "  GeoIP update : ${LOG_DIR}/geoip-update.log"
+    echo "  Live tail    : journalctl -u fluxio -f"
+    echo
     echo "Next steps:"
     echo "  - Point your NetFlow exporter to ${host_ip}:${nf_port}"
     echo "  - Open the dashboard and configure DPI mode under Settings"
     if [[ -z "$wazuh_ip" ]]; then
         echo "  - Wazuh forwarding: set WAZUH_MANAGER_IP in .env and run 'docker compose restart backend'"
+    fi
+    if [[ "$INSTALL_MODE" == "production" ]]; then
+        echo "  - GeoIP updates    : automatic every Sunday 03:00"
+        echo "    Manual update    : systemctl start fluxio-geoip-update.service"
     fi
     if [[ "$INSTALL_MODE" == "development" ]]; then
         echo
@@ -456,8 +691,10 @@ print_summary() {
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 main() {
-    header "Flux.io Installer"
     check_root "$@"
+    setup_logging
+
+    header "Flux.io Installer"
 
     detect_distro
     install_docker
@@ -478,24 +715,23 @@ main() {
 
     if [[ "$INSTALL_MODE" == "production" ]]; then
         # Download GeoIP BEFORE containers start so the backend finds the
-        # .mmdb files on its very first boot (the volume mount is read at
-        # container-create time, but the backend reads the files at runtime).
+        # .mmdb files on its very first boot.
         download_geoip
-        # Let systemd own the container lifecycle — it calls `docker compose up`
-        # on start/restart. We do NOT also run `docker compose up -d` here to
-        # avoid two processes managing the same compose project simultaneously.
+        # Install the weekly auto-updater timer.
+        install_geoip_updater
+        # Let systemd own the container lifecycle.
         install_systemd_service
     else
-        # Development mode: start containers directly; systemd not involved.
+        # Development: start containers directly.
         if ! docker compose up -d; then
             error "docker compose up failed. Showing last 20 log lines:"
             docker compose logs --tail=20 || true
-            error "Run 'docker compose logs' for full details."
             exit 1
         fi
         success "Containers started."
     fi
 
+    # Block here until the full stack is confirmed healthy.
     wait_for_healthy
     print_summary
 }

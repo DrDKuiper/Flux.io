@@ -156,6 +156,18 @@ func main() {
 	go func() {
 		for flow := range flowCh {
 			geoIP.EnrichFlow(&flow)
+
+			tuple := processor.FiveTuple{
+				SrcIP: flow.SourceIP, DstIP: flow.DestinationIP,
+				SrcPort: flow.SourcePort, DstPort: flow.DestinationPort, Protocol: flow.Protocol,
+			}
+			if meta, ok := correlationCache.Get(tuple); ok {
+				flow.Application = meta.Application
+				flow.SNI = meta.SNI
+				flow.HTTPHost = meta.HTTPHost
+				flow.HTTPURL = meta.HTTPURL
+			}
+
 			writer.WriteFlow(flow)
 		}
 	}()

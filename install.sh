@@ -816,7 +816,7 @@ wait_for_healthy() {
                 error "Fix the issue above and run: systemctl start fluxio"
                 exit 1
             fi
-            (( svc_attempts++ ))
+            svc_attempts=$(( svc_attempts + 1 ))
             if (( svc_attempts % 10 == 0 )); then
                 info "Still waiting for systemd service... (${svc_attempts}s elapsed)"
                 info "Live logs: journalctl -u fluxio -f"
@@ -831,29 +831,32 @@ wait_for_healthy() {
     info "Waiting for all containers to reach 'running' state ..."
     local container_attempts=0
     while true; do
-        local total running exited
-        # Count containers by status — compose ps --format json requires v2.17+,
-        # so we use the plain text output which is universally available.
-        total=$(docker compose -f "${REPO_DIR}/docker-compose.yml" ps --all 2>/dev/null \
-                | tail -n +2 | grep -v '^$' | wc -l || echo 0)
-        running=$(docker compose -f "${REPO_DIR}/docker-compose.yml" ps 2>/dev/null \
-                | tail -n +2 | grep -v '^$' | grep -c ' Up \| running' || echo 0)
-        exited=$(docker compose -f "${REPO_DIR}/docker-compose.yml" ps --all 2>/dev/null \
-                | tail -n +2 | grep -c ' Exit\| exited' || echo 0)
+        # Run compose ps once and parse the same output — avoids multiple docker calls
+        # and prevents the grep-c || echo double-capture bug under set -euo pipefail.
+        local _ps_out _ps_lines total running exited
+        _ps_out="$(docker compose -f "${REPO_DIR}/docker-compose.yml" ps --all 2>/dev/null || true)"
+        _ps_lines="$(echo "$_ps_out" | tail -n +2 | grep -v '^$' || true)"
 
-        if (( total > 0 )) && (( running >= total )); then
+        # grep -c returns exit 1 when count is 0; || true prevents set -e from killing us.
+        # Strip whitespace that wc -l sometimes adds on older coreutils.
+        total="$(  echo "$_ps_lines" | grep -c '.'        || true)"; total="${total//[[:space:]]/}";   total="${total:-0}"
+        running="$(echo "$_ps_lines" | grep -cE 'Up |running' || true)"; running="${running//[[:space:]]/}"; running="${running:-0}"
+        exited="$( echo "$_ps_lines" | grep -cE 'Exit|exited'  || true)"; exited="${exited//[[:space:]]/}";  exited="${exited:-0}"
+
+        if [[ "$total" -gt 0 ]] && [[ "$running" -ge "$total" ]]; then
             success "All ${total} containers are running."
             break
         fi
 
-        if (( exited > 0 )); then
+        if [[ "$exited" -gt 0 ]]; then
+            echo
             warn "One or more containers have exited. Showing logs:"
             docker compose -f "${REPO_DIR}/docker-compose.yml" logs --tail=30 || true
             error "Fix the issue above."
             exit 1
         fi
 
-        (( container_attempts++ ))
+        container_attempts=$(( container_attempts + 1 ))
         if (( container_attempts % 15 == 0 )); then
             info "Containers: ${running}/${total} running (${container_attempts}s elapsed)"
         fi
@@ -874,7 +877,7 @@ wait_for_healthy() {
             return
         fi
 
-        (( api_attempts++ ))
+        api_attempts=$(( api_attempts + 1 ))
         if (( api_attempts % 15 == 0 )); then
             info "API not ready yet (HTTP ${http_status}, ${api_attempts}s elapsed)"
             info "Container logs: docker compose logs --tail=20 backend"

@@ -3,6 +3,7 @@ package settings
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
@@ -29,7 +30,7 @@ func NewRepository(db *sql.DB) *Repository {
 func (r *Repository) GetDPIMode(ctx context.Context) (string, error) {
 	var mode string
 	err := r.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = 'dpi_mode'`).Scan(&mode)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "none", nil
 	}
 	if err != nil {

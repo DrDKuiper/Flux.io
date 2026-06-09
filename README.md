@@ -353,6 +353,45 @@ To create a custom decoder in Wazuh (`/var/ossec/etc/decoders/local_decoder.xml`
 
 ---
 
+## Updating
+
+To apply a new version to an existing installation:
+
+```bash
+cd /path/to/Flux.io
+git pull
+sudo ./install.sh
+```
+
+The wizard detects your existing `.env` and asks `[K]eep / [O]verwrite / [E]dit` — press **Enter** to keep your current config. All steps are idempotent: Docker, Go, Node, and the systemd service are skipped if already up to date.
+
+---
+
+## Uninstalling
+
+```bash
+sudo ./uninstall.sh
+```
+
+Three modes:
+
+| Mode | What is removed |
+|---|---|
+| **Services only** | systemd units (`fluxio.service`, `fluxio-geoip-update.timer`), update script |
+| **Full uninstall** | Everything above + containers, Docker volumes (all data), logs, GeoIP files, `.env`, firewall rules |
+| **Custom** | Step-by-step confirmation for each component |
+
+Non-interactive (CI / automation):
+
+```bash
+# Full uninstall with no prompts
+sudo ./uninstall.sh --yes
+```
+
+The uninstaller always saves a timestamped `.env.bak.YYYYMMDDHHMMSS` backup before removing the config file.
+
+---
+
 ## Roadmap
 
 - [ ] Grafana dashboard integration (pre-built dashboards for ClickHouse)
@@ -360,8 +399,7 @@ To create a custom decoder in Wazuh (`/var/ossec/etc/decoders/local_decoder.xml`
 - [ ] Alert rules engine with custom thresholds
 - [ ] Multi-tenant / RBAC settings API
 - [ ] HTTPS / TLS termination built into the installer
-- [ ] Uninstaller script (`./uninstall.sh`)
-- [ ] Automated upgrade path (`git pull && ./install.sh`)
+- [ ] Quiet/non-interactive install mode (`./install.sh --yes`)
 
 ---
 

@@ -61,21 +61,25 @@ func TestFileTailer_RetriesUntilFileExists(t *testing.T) {
 	defer cancel()
 
 	tailer := NewFileTailer(path)
+	tailer.retryInterval = 50 * time.Millisecond // speed up retries in tests
+
 	lines, err := tailer.Lines(ctx)
 	if err != nil {
 		t.Fatalf("Lines returned error: %v", err)
 	}
 
-	time.Sleep(200 * time.Millisecond) // tailer should be retrying quietly here
+	// The goroutine is now retrying every 50ms. Wait briefly to confirm it's
+	// retrying (file still absent), then create the file empty so the goroutine
+	// opens it and seeks to EOF at offset 0.
+	time.Sleep(75 * time.Millisecond)
 
-	// Create the file EMPTY so the tailer opens it at offset 0 (EOF).
-	// Lines adds the "seek to EOF on open" behaviour, so we must append the
-	// content AFTER the tailer has had a chance to open and seek — not before.
 	if err := os.WriteFile(path, []byte{}, 0644); err != nil {
 		t.Fatalf("failed to create file: %v", err)
 	}
 
-	time.Sleep(200 * time.Millisecond) // let the tailer open the now-existing file and seek to EOF
+	// Wait for the goroutine to open the now-existing empty file and seek to
+	// EOF (offset 0). Two retry windows (100ms) is a generous margin.
+	time.Sleep(150 * time.Millisecond)
 
 	appendFile, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {

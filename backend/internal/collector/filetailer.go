@@ -14,11 +14,12 @@ import (
 // It tolerates the file not existing yet (retrying until it appears) — useful
 // when Suricata hasn't written its first eve.json line before Flux.io starts.
 type FileTailer struct {
-	path string
+	path          string
+	retryInterval time.Duration
 }
 
 func NewFileTailer(path string) *FileTailer {
-	return &FileTailer{path: path}
+	return &FileTailer{path: path, retryInterval: 2 * time.Second}
 }
 
 // Lines starts tailing in a background goroutine and returns a channel of
@@ -60,7 +61,7 @@ func (t *FileTailer) run(ctx context.Context, out chan<- string) {
 		}
 
 		select {
-		case out <- strings.TrimRight(line, "\n"):
+		case out <- strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r"):
 		case <-ctx.Done():
 			return
 		}
@@ -80,7 +81,7 @@ func (t *FileTailer) openWithRetry(ctx context.Context) *os.File {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(2 * time.Second):
+		case <-time.After(t.retryInterval):
 		}
 	}
 }

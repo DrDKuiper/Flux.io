@@ -57,6 +57,7 @@ services:
       - WAZUH_MANAGER_PORT=1514 # Porta syslog ou API do Wazuh
       - GEOIP_CITY_DB=/root/geoip/GeoLite2-City.mmdb
       - GEOIP_ASN_DB=/root/geoip/GeoLite2-ASN.mmdb
+      - NETFLOW_PORT=2055
     depends_on:
       - clickhouse
       - postgres

@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/websocket/v2"
+
+	"fluxio-backend/internal/collector"
+	"fluxio-backend/internal/processor"
+	"fluxio-backend/internal/storage"
 )
 
 func main() {
@@ -84,12 +90,36 @@ func main() {
 		port = "8080"
 	}
 
-	// Inicializa o Wazuh Forwarder em background (Goroutine)
-	wazuhIP := os.Getenv("WAZUH_MANAGER_IP")
-	wazuhPort := os.Getenv("WAZUH_MANAGER_PORT")
-	// import "fluxio-backend/internal/collector" seria necessário aqui na vida real,
-	// porém como estamos demonstrando o esqueleto, omitimos o start se não estiver na GOPATH 
-	log.Printf("Wazuh Integration configured for: %s:%s", wazuhIP, wazuhPort)
+	pipelineCtx, cancelPipeline := context.WithCancel(context.Background())
+	defer cancelPipeline()
+
+	store, err := storage.NewClickHouseStore(os.Getenv("CLICKHOUSE_DSN"))
+	if err != nil {
+		log.Fatalf("Failed to connect to ClickHouse: %v", err)
+	}
+
+	writer := storage.NewBatchWriter(store, 1000, 5*time.Second)
+	go writer.Run(pipelineCtx)
+
+	geoIP, err := processor.NewGeoIPEnricher(os.Getenv("GEOIP_CITY_DB"), os.Getenv("GEOIP_ASN_DB"))
+	if err != nil {
+		log.Fatalf("Failed to initialize GeoIP enrichment: %v", err)
+	}
+	defer geoIP.Close()
+
+	flowCh := make(chan processor.FlowRecord, 10000)
+	go func() {
+		for flow := range flowCh {
+			geoIP.EnrichFlow(&flow)
+			writer.WriteFlow(flow)
+		}
+	}()
+
+	netflowPort := os.Getenv("NETFLOW_PORT")
+	if netflowPort == "" {
+		netflowPort = "2055"
+	}
+	go collector.StartNetFlowListener(netflowPort, flowCh)
 
 	log.Printf("Starting Flux.io Backend on :%s", port)
 	if err := app.Listen(":" + port); err != nil {

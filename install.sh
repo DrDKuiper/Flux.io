@@ -192,11 +192,12 @@ EOF
 # ─── Port conflict checker ────────────────────────────────────────────────────
 _port_in_use_tcp() {
     local port="$1"
+    # Anchor on whitespace or EOL so :80 doesn't false-match :8080
     if command -v ss &>/dev/null; then
-        ss -tlnp 2>/dev/null | grep -q ":${port} " && return 0
+        ss -H -tlnp 2>/dev/null | grep -qE "[[:space:]]:${port}([[:space:]]|$)" && return 0
     fi
     if command -v netstat &>/dev/null; then
-        netstat -tlnp 2>/dev/null | grep -q ":${port} " && return 0
+        netstat -tlnp 2>/dev/null | grep -qE "[[:space:]]:${port}([[:space:]]|$)" && return 0
     fi
     return 1
 }
@@ -204,10 +205,10 @@ _port_in_use_tcp() {
 _port_in_use_udp() {
     local port="$1"
     if command -v ss &>/dev/null; then
-        ss -ulnp 2>/dev/null | grep -q ":${port} " && return 0
+        ss -H -ulnp 2>/dev/null | grep -qE "[[:space:]]:${port}([[:space:]]|$)" && return 0
     fi
     if command -v netstat &>/dev/null; then
-        netstat -ulnp 2>/dev/null | grep -q ":${port} " && return 0
+        netstat -ulnp 2>/dev/null | grep -qE "[[:space:]]:${port}([[:space:]]|$)" && return 0
     fi
     return 1
 }
@@ -397,10 +398,30 @@ EOF
     success "fluxio.service installed and enabled. Check status: systemctl status fluxio"
 }
 
+# ─── Health check ────────────────────────────────────────────────────────────
+wait_for_healthy() {
+    local http_port
+    http_port="$(_env_val PORT)"
+    local url="http://127.0.0.1:${http_port}/api/health"
+    info "Waiting for Flux.io to be ready at ${url} ..."
+    local attempts=0
+    while (( attempts < 30 )); do
+        if curl -fsS "$url" &>/dev/null; then
+            success "Flux.io is healthy."
+            return
+        fi
+        (( attempts++ ))
+        sleep 2
+    done
+    warn "Flux.io did not respond at ${url} within 60 seconds."
+    warn "Check container logs: docker compose logs --tail=30"
+}
+
 # ─── Summary screen ───────────────────────────────────────────────────────────
 print_summary() {
     local host_ip
     host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    host_ip="${host_ip:-localhost}"
     local http_port nf_port tzsp_port wazuh_ip
     http_port="$(_env_val PORT)"
     nf_port="$(_env_val NETFLOW_PORT)"
@@ -454,19 +475,28 @@ main() {
 
     header "Starting Flux.io"
     cd "${REPO_DIR}"
-    if ! docker compose up -d; then
-        error "docker compose up failed. Showing last 20 log lines:"
-        docker compose logs --tail=20 || true
-        error "Run 'docker compose logs' for full details."
-        exit 1
-    fi
-    success "Containers started."
 
     if [[ "$INSTALL_MODE" == "production" ]]; then
+        # Download GeoIP BEFORE containers start so the backend finds the
+        # .mmdb files on its very first boot (the volume mount is read at
+        # container-create time, but the backend reads the files at runtime).
         download_geoip
+        # Let systemd own the container lifecycle — it calls `docker compose up`
+        # on start/restart. We do NOT also run `docker compose up -d` here to
+        # avoid two processes managing the same compose project simultaneously.
         install_systemd_service
+    else
+        # Development mode: start containers directly; systemd not involved.
+        if ! docker compose up -d; then
+            error "docker compose up failed. Showing last 20 log lines:"
+            docker compose logs --tail=20 || true
+            error "Run 'docker compose logs' for full details."
+            exit 1
+        fi
+        success "Containers started."
     fi
 
+    wait_for_healthy
     print_summary
 }
 

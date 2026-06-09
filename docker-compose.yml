@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:24.3-alpine
@@ -51,13 +49,18 @@ services:
       - ./suricata/logs:/var/log/suricata:ro
       - ./backend/geoip:/root/geoip:ro
     environment:
+      # CLICKHOUSE_DSN and POSTGRES_DSN can be overridden via .env for
+      # non-standard deployments; otherwise compose reconstructs them from
+      # the individual credential/port variables above.
       - CLICKHOUSE_DSN=${CLICKHOUSE_DSN:-clickhouse://default:@clickhouse:9000/fluxio}
-      - POSTGRES_DSN=postgres://fluxio:${POSTGRES_PASSWORD:-fluxio_password}@postgres:5432/fluxioclient?sslmode=disable
+      - POSTGRES_DSN=${POSTGRES_DSN:-postgres://fluxio:${POSTGRES_PASSWORD:-fluxio_password}@postgres:5432/fluxioclient?sslmode=disable}
       - WAZUH_MANAGER_IP=${WAZUH_MANAGER_IP:-}
       - WAZUH_MANAGER_PORT=${WAZUH_MANAGER_PORT:-1514}
       - NETFLOW_PORT=${NETFLOW_PORT:-2055}
       - TZSP_PORT=${TZSP_PORT:-37008}
       - SURICATA_EVE_LOG_PATH=${SURICATA_EVE_LOG_PATH:-/var/log/suricata/eve.json}
+      # GeoIP paths inside the container — the ./backend/geoip host directory
+      # is mounted at /root/geoip (see volumes above).
       - GEOIP_CITY_DB=/root/geoip/GeoLite2-City.mmdb
       - GEOIP_ASN_DB=/root/geoip/GeoLite2-ASN.mmdb
     depends_on:

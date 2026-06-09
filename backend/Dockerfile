@@ -11,11 +11,15 @@ FROM golang:1.22-alpine AS backend-builder
 WORKDIR /app/backend
 RUN apk add --no-cache gcc musl-dev libpcap-dev
 COPY backend/go.mod ./
-# go.sum may not exist in the repo yet — go mod tidy generates it from scratch
-# inside the build container (which has internet access) before compiling.
+# First tidy: downloads all modules into the layer cache (fast re-build when
+# only source changes, not dependencies).
 RUN go mod tidy
+# Copy the rest of the source — this overwrites the working directory, which
+# removes the generated go.sum (it is not committed to the repo). The second
+# tidy re-generates go.sum instantly because the module cache is still warm.
 COPY backend/ ./
-RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o fluxio-backend ./cmd/server/main.go
+RUN go mod tidy && \
+    CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o fluxio-backend ./cmd/server/main.go
 
 # Stage 3: Final Image
 FROM alpine:latest

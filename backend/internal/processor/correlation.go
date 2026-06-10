@@ -8,6 +8,7 @@ import (
 
 type correlationEntry struct {
 	metadata  DPIMetadata
+	mechanism string // "suricata" or "tzsp" — which capture produced this entry
 	expiresAt time.Time
 }
 
@@ -32,11 +33,12 @@ func NewCorrelationCache(ttl time.Duration) *CorrelationCache {
 	}
 }
 
-// Put records DPI metadata for a conversation, resetting its expiry.
-func (c *CorrelationCache) Put(key FiveTuple, meta DPIMetadata) {
+// Put records DPI metadata for a conversation, tagged with the capture
+// mechanism that produced it ("suricata" or "tzsp"), resetting its expiry.
+func (c *CorrelationCache) Put(key FiveTuple, meta DPIMetadata, mechanism string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries[key] = correlationEntry{metadata: meta, expiresAt: time.Now().Add(c.ttl)}
+	c.entries[key] = correlationEntry{metadata: meta, mechanism: mechanism, expiresAt: time.Now().Add(c.ttl)}
 }
 
 // Get returns the DPI metadata for a conversation if it's present and not
@@ -46,6 +48,25 @@ func (c *CorrelationCache) Get(key FiveTuple) (DPIMetadata, bool) {
 	defer c.mu.RUnlock()
 	entry, ok := c.entries[key]
 	if !ok || time.Now().After(entry.expiresAt) {
+		return DPIMetadata{}, false
+	}
+	return entry.metadata, true
+}
+
+// GetForMode returns DPI metadata for a conversation subject to the source's
+// dpi_mode: "none" never matches; "auto" matches any entry; "suricata"/"tzsp"
+// match only entries produced by that mechanism. Expired entries are a miss.
+func (c *CorrelationCache) GetForMode(key FiveTuple, mode string) (DPIMetadata, bool) {
+	if mode == "none" {
+		return DPIMetadata{}, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entry, ok := c.entries[key]
+	if !ok || time.Now().After(entry.expiresAt) {
+		return DPIMetadata{}, false
+	}
+	if mode != "auto" && entry.mechanism != mode {
 		return DPIMetadata{}, false
 	}
 	return entry.metadata, true

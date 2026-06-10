@@ -49,7 +49,7 @@ func processEveLine(line string, cache *processor.CorrelationCache, alerts alert
 	tuple, hasTuple := evt.FiveTuple()
 	meta, hasMeta := evt.DPIMetadata()
 	if hasTuple && hasMeta {
-		cache.Put(tuple, meta)
+		cache.Put(tuple, meta, "suricata")
 	}
 
 	if alert, ok := evt.ToAlert(); ok {

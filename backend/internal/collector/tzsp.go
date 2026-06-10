@@ -88,11 +88,11 @@ func processTZSPPacket(raw []byte, cache *processor.CorrelationCache) {
 	}
 
 	if sni, ok := extractTLSSNI(payload); ok {
-		cache.Put(tuple, processor.DPIMetadata{SNI: sni, Application: "TLS/" + sni})
+		cache.Put(tuple, processor.DPIMetadata{SNI: sni, Application: "TLS/" + sni}, "tzsp")
 		return
 	}
 	if query, ok := extractDNSQueryName(payload); ok {
-		cache.Put(tuple, processor.DPIMetadata{DNSQuery: query, Application: "DNS/" + query})
+		cache.Put(tuple, processor.DPIMetadata{DNSQuery: query, Application: "DNS/" + query}, "tzsp")
 	}
 }
 

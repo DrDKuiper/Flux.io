@@ -188,7 +188,20 @@ run_wizard() {
     read -rp "Backend HTTP port [80]: " http_port
     http_port="${http_port:-80}"
 
+    # Auto-generate a strong JWT signing secret so production never runs on the
+    # insecure default. The admin password is left blank → the backend generates
+    # one on first boot and prints it once in the logs.
+    local jwt_secret
+    if command -v openssl &>/dev/null; then
+        jwt_secret="$(openssl rand -base64 32)"
+    else
+        jwt_secret="$(head -c 32 /dev/urandom | base64)"
+    fi
+
     cat > "${REPO_DIR}/.env" <<EOF
+JWT_SECRET=${jwt_secret}
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=
 WAZUH_MANAGER_IP=${wazuh_ip}
 WAZUH_MANAGER_PORT=${wazuh_port}
 POSTGRES_PASSWORD=${pg_pass}

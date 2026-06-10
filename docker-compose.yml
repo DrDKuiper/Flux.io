@@ -55,6 +55,9 @@ services:
       # the individual credential/port variables above.
       - CLICKHOUSE_DSN=${CLICKHOUSE_DSN:-clickhouse://default:@clickhouse:9000/fluxio}
       - POSTGRES_DSN=${POSTGRES_DSN:-postgres://fluxio:${POSTGRES_PASSWORD:-fluxio_password}@postgres:5432/fluxioclient?sslmode=disable}
+      - JWT_SECRET=${JWT_SECRET:-}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
       - WAZUH_MANAGER_IP=${WAZUH_MANAGER_IP:-}
       - WAZUH_MANAGER_PORT=${WAZUH_MANAGER_PORT:-1514}
       - NETFLOW_PORT=${NETFLOW_PORT:-2055}

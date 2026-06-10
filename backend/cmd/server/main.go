@@ -15,8 +15,16 @@ import (
 	"fluxio-backend/internal/collector"
 	"fluxio-backend/internal/processor"
 	"fluxio-backend/internal/settings"
+	"fluxio-backend/internal/sources"
 	"fluxio-backend/internal/storage"
 )
+
+// noopSwitcher satisfies the settings route's modeSwitcher without acting on a
+// live listener. The global DPI mode is superseded by per-source dpi_mode; this
+// keeps the legacy /api/settings route compiling until B2 removes it.
+type noopSwitcher struct{}
+
+func (noopSwitcher) SetMode(context.Context, string) error { return nil }
 
 func main() {
 	app := fiber.New()
@@ -65,6 +73,27 @@ func main() {
 	pipelineCtx, cancelPipeline := context.WithCancel(context.Background())
 	defer cancelPipeline()
 
+	// Source registry: auto-discovers exporters/sensors, gates ingestion, and
+	// holds per-host DPI mode. Warm the cache from Postgres at startup.
+	sourceRepo := sources.NewRepository(pgDB)
+	sourceReg := sources.NewRegistry(sourceRepo)
+	if err := sourceReg.Load(context.Background()); err != nil {
+		log.Printf("sources: failed to warm cache: %v", err)
+	}
+	sourceStats := sources.NewStats()
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-pipelineCtx.Done():
+				return
+			case <-t.C:
+				sourceStats.Roll()
+			}
+		}
+	}()
+
 	correlationCache := processor.NewCorrelationCache(30 * time.Second)
 	go correlationCache.CleanupLoop(pipelineCtx, 10*time.Second)
 
@@ -96,16 +125,30 @@ func main() {
 		},
 	})
 
-	startupMode, err := settingsRepo.GetDPIMode(context.Background())
-	if err != nil {
-		log.Printf("Failed to read saved DPI mode, defaulting to 'none': %v", err)
-		startupMode = "none"
+	// The DPI manager runs the union of mechanisms the enabled sources request
+	// (per-source dpi_mode). A reconcile loop applies changes made via the
+	// Sources API without a restart. This supersedes the old global dpi_mode.
+	reconcile := func() {
+		suri, tzsp := sourceReg.RequestedMechanisms()
+		dpiManager.Reconcile(pipelineCtx, suri, tzsp)
 	}
-	if err := dpiManager.SetMode(pipelineCtx, startupMode); err != nil {
-		log.Printf("Failed to start DPI mode %q: %v", startupMode, err)
-	}
+	reconcile()
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-pipelineCtx.Done():
+				return
+			case <-t.C:
+				reconcile()
+			}
+		}
+	}()
 
-	registerSettingsRoutes(api, settingsRepo, dpiManager)
+	// The global /api/settings route is retained but inert (its switch is a
+	// no-op); per-source DPI mode supersedes it and B2 removes it entirely.
+	registerSettingsRoutes(api, settingsRepo, noopSwitcher{})
 
 	wazuhIP := os.Getenv("WAZUH_MANAGER_IP")
 	wazuhPort := os.Getenv("WAZUH_MANAGER_PORT")
@@ -164,17 +207,20 @@ func main() {
 		for flow := range flowCh {
 			geoIP.EnrichFlow(&flow)
 
+			// Apply DPI metadata per the source's configured dpi_mode.
+			dpiMode := sourceReg.Observe(context.Background(), flow.Source, "netflow").DPIMode
 			tuple := processor.FiveTuple{
 				SrcIP: flow.SourceIP, DstIP: flow.DestinationIP,
 				SrcPort: flow.SourcePort, DstPort: flow.DestinationPort, Protocol: flow.Protocol,
 			}
-			if meta, ok := correlationCache.Get(tuple); ok {
+			if meta, ok := correlationCache.GetForMode(tuple, dpiMode); ok {
 				flow.Application = meta.Application
 				flow.SNI = meta.SNI
 				flow.HTTPHost = meta.HTTPHost
 				flow.HTTPURL = meta.HTTPURL
 			}
 
+			sourceStats.Record(flow.Source, flow.Bytes)
 			writer.WriteFlow(flow)
 		}
 	}()
@@ -183,7 +229,10 @@ func main() {
 	if netflowPort == "" {
 		netflowPort = "2055"
 	}
-	go collector.StartNetFlowListener(netflowPort, flowCh)
+	go collector.StartNetFlowListener(netflowPort, flowCh, func(addr string) (bool, bool) {
+		d := sourceReg.Observe(context.Background(), addr, "netflow")
+		return d.Enabled, true
+	})
 
 	log.Printf("Starting Flux.io Backend on :%s", port)
 	if err := app.Listen(":" + port); err != nil {

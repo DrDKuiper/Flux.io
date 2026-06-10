@@ -13,9 +13,10 @@ type correlationEntry struct {
 }
 
 // CorrelationCache is a TTL'd map from FiveTuple to DPIMetadata. It is the
-// hand-off point between whichever DPI source is active (Suricata
-// correlation or TZSP capture) and the main flow-processing pipeline:
-// both write Put(); the pipeline calls Get() while enriching each flow.
+// hand-off point between the DPI capture mechanisms (Suricata correlation and
+// TZSP capture, which may run concurrently) and the main flow-processing
+// pipeline: both write Put() tagged with their mechanism; the pipeline calls
+// GetForMode() while enriching each flow, honoring the source's dpi_mode.
 //
 // Entries expire after ttl — conversations are short-lived, and an unbounded
 // map would grow forever on a busy network. CleanupLoop runs a periodic

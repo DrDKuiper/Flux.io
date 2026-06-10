@@ -20,9 +20,8 @@ type store interface {
 type Registry struct {
 	store store
 
-	mu      sync.RWMutex
-	byKey   map[string]Source // key = address|type
-	dropped uint64
+	mu    sync.RWMutex
+	byKey map[string]Source // key = address|type
 }
 
 func key(address, typ string) string { return address + "|" + typ }

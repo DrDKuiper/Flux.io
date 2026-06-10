@@ -80,6 +80,10 @@ func main() {
 	if err := sourceReg.Load(context.Background()); err != nil {
 		log.Printf("sources: failed to warm cache: %v", err)
 	}
+	// Seed the local Suricata sensor as its own source so DPI/alert capture is
+	// on by default from boot (independent of any NetFlow exporter's dpi_mode)
+	// and so the sensor is independently configurable on the Sources screen.
+	sourceReg.Observe(context.Background(), "127.0.0.1", "suricata")
 	sourceStats := sources.NewStats()
 	go func() {
 		t := time.NewTicker(time.Second)

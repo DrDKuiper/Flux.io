@@ -2,109 +2,80 @@ package collector
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"sync"
 
 	"fluxio-backend/internal/processor"
 )
 
-// sourceRunFunc runs one DPI source until ctx is cancelled. Both
-// RunSuricataCorrelator (Task 14) and a TZSP-listener wrapper (Task 15)
-// satisfy this shape once their cache/path/port arguments are bound by
-// a closure — see the wiring in main.go.
+// sourceRunFunc runs one DPI capture mechanism until ctx is cancelled. Both
+// RunSuricataCorrelator and a TZSP-listener wrapper satisfy this shape once
+// their cache/path/port arguments are bound by a closure — see main.go.
 type sourceRunFunc func(ctx context.Context)
 
-// DPIManagerSources binds each named mode to the function that runs it.
-// Exposed as a struct (rather than a map) so call sites are type-checked
-// and self-documenting about which modes exist.
+// DPIManagerSources binds each capture mechanism to the function that runs it.
 type DPIManagerSources struct {
 	Suricata sourceRunFunc
 	TZSP     sourceRunFunc
 }
 
-// DPIManager owns the currently-active DPI source and can hot-swap it:
-// SetMode cancels whatever is running and starts the requested mode,
-// so a change made on the Settings page (via PUT /api/settings)
-// takes effect immediately without a backend restart.
-type DPIManager struct {
-	cache   *processor.CorrelationCache
-	sources DPIManagerSources
-
-	mu     sync.Mutex
-	mode   string
+type runningMech struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
+// DPIManager runs the set of DPI capture mechanisms requested by the sources.
+// Unlike the previous single-mode hot-swap, mechanisms run concurrently: a
+// source asking for TZSP can start the TZSP listener without disturbing the
+// Suricata correlator another source relies on. Reconcile starts/stops
+// mechanisms to match a desired set and is idempotent.
+type DPIManager struct {
+	cache   *processor.CorrelationCache
+	sources DPIManagerSources
+
+	mu      sync.Mutex
+	running map[string]*runningMech // "suricata" / "tzsp"
+}
+
 func NewDPIManager(cache *processor.CorrelationCache, sources DPIManagerSources) *DPIManager {
-	return &DPIManager{cache: cache, sources: sources, mode: "none"}
+	return &DPIManager{cache: cache, sources: sources, running: make(map[string]*runningMech)}
 }
 
-// SetMode stops the currently-running source (if any) and starts the one
-// matching mode ("none" stops without starting anything). It blocks until
-// the previous source has fully stopped, so callers can rely on there never
-// being two sources running concurrently.
-func (m *DPIManager) SetMode(ctx context.Context, mode string) error {
-	var run sourceRunFunc
-	switch mode {
-	case "none":
-		run = nil
-	case "suricata":
-		run = m.sources.Suricata
-	case "tzsp":
-		run = m.sources.TZSP
-	default:
-		return fmt.Errorf("dpi-manager: unknown mode %q", mode)
-	}
-
+// Reconcile ensures exactly the requested mechanisms are running, starting or
+// stopping each as needed. Calling it with an unchanged set is a no-op.
+func (m *DPIManager) Reconcile(ctx context.Context, wantSuricata, wantTZSP bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	m.stopLocked()
-	m.mode = mode
-
-	if run == nil {
-		return nil
-	}
-
-	runCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	m.cancel = cancel
-	m.done = done
-
-	go func() {
-		defer close(done)
-		log.Printf("dpi-manager: starting %q DPI source", mode)
-		run(runCtx)
-		log.Printf("dpi-manager: %q DPI source stopped", mode)
-	}()
-
-	return nil
+	m.applyLocked(ctx, "suricata", wantSuricata, m.sources.Suricata)
+	m.applyLocked(ctx, "tzsp", wantTZSP, m.sources.TZSP)
 }
 
-// Stop cancels the active source, if any, and waits for it to finish.
+func (m *DPIManager) applyLocked(ctx context.Context, name string, want bool, run sourceRunFunc) {
+	_, isRunning := m.running[name]
+	switch {
+	case want && !isRunning && run != nil:
+		runCtx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		m.running[name] = &runningMech{cancel: cancel, done: done}
+		go func() {
+			defer close(done)
+			log.Printf("dpi-manager: starting %q", name)
+			run(runCtx)
+			log.Printf("dpi-manager: %q stopped", name)
+		}()
+	case !want && isRunning:
+		rm := m.running[name]
+		delete(m.running, name)
+		rm.cancel()
+		// Release the lock while waiting so a mechanism goroutine that calls
+		// back into the manager cannot deadlock.
+		m.mu.Unlock()
+		<-rm.done
+		m.mu.Lock()
+	}
+}
+
+// Stop cancels all running mechanisms and waits for them to exit.
 func (m *DPIManager) Stop() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.stopLocked()
-	m.mode = "none"
-}
-
-// stopLocked cancels the current source and waits for it to exit.
-// It briefly releases m.mu while waiting so a source goroutine that calls
-// back into the manager (or any other caller) is not deadlocked.
-// Caller must hold m.mu on entry; it will still hold m.mu on return.
-func (m *DPIManager) stopLocked() {
-	if m.cancel == nil {
-		return
-	}
-	cancel := m.cancel
-	done := m.done
-	m.cancel = nil
-	m.done = nil
-	cancel()
-	m.mu.Unlock()
-	<-done // wait without holding the lock
-	m.mu.Lock()
+	m.Reconcile(context.Background(), false, false)
 }

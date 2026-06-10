@@ -9,11 +9,29 @@ import (
 	"fluxio-backend/internal/processor"
 )
 
+// GateFunc reports whether telemetry from exporter addr should be accepted.
+// The bool result is "enabled"; the second return mirrors the registry Decision
+// shape (it is unused by the listener but keeps call sites self-documenting).
+type GateFunc func(addr string) (enabled bool, _ bool)
+
+// applyGate stamps rec.Source with the exporter address and returns whether the
+// record should be kept, per the gate decision.
+func applyGate(addr string, rec processor.FlowRecord, gate GateFunc) (processor.FlowRecord, bool) {
+	enabled, _ := gate(addr)
+	if !enabled {
+		return rec, false
+	}
+	rec.Source = addr
+	return rec, true
+}
+
 // StartNetFlowListener listens for NetFlow v9 / IPFIX UDP packets on the given
-// port, decodes them, and pushes normalized FlowRecords onto out. It runs
-// until the process exits; malformed packets are logged and skipped so a
-// single bad exporter can't take the listener down.
-func StartNetFlowListener(port string, out chan<- processor.FlowRecord) {
+// port, decodes them, and pushes normalized FlowRecords onto out. Each record
+// is passed through gate: telemetry from a disabled source is dropped, and the
+// exporter address is stamped onto kept records. It runs until the process
+// exits; malformed packets are logged and skipped so a single bad exporter
+// can't take the listener down.
+func StartNetFlowListener(port string, out chan<- processor.FlowRecord, gate GateFunc) {
 	addr, err := net.ResolveUDPAddr("udp", ":"+port)
 	if err != nil {
 		log.Fatalf("netflow: error resolving UDP address: %v", err)
@@ -35,6 +53,7 @@ func StartNetFlowListener(port string, out chan<- processor.FlowRecord) {
 			log.Printf("netflow: error reading from UDP: %v", err)
 			continue
 		}
+		exporter := remoteAddr.IP.String()
 
 		flows, err := decoder.Decode(remoteAddr.String(), buf[:n])
 		if err != nil {
@@ -44,7 +63,11 @@ func StartNetFlowListener(port string, out chan<- processor.FlowRecord) {
 
 		now := time.Now().UTC()
 		for _, flow := range flows {
-			out <- toFlowRecord(flow, now)
+			rec, keep := applyGate(exporter, toFlowRecord(flow, now), gate)
+			if !keep {
+				continue
+			}
+			out <- rec
 		}
 	}
 }

@@ -2,7 +2,12 @@
 
 **Date:** 2026-06-10
 **Status:** Approved
-**Sub-project:** B (of A→B→C: merge pipeline → backend read APIs → frontend)
+**Sub-project:** B2 (of A → B1 → B2 → C: merge pipeline → sources backend → read APIs → frontend)
+
+> Depends on **B1 (Sources backend)** — flows carry a `source` dimension, so every
+> read endpoint below additionally accepts an optional `source` filter, and this
+> router also implements the source endpoints (`GET /api/sources`,
+> `GET /api/sources/:id`, `PATCH /api/sources/:id`) defined in the B1 spec.
 
 ---
 
@@ -129,6 +134,10 @@ interface the API package consumes):
 `since` is computed from the `range` parameter. `Throughput` buckets the window
 into N equal time buckets via ClickHouse `toStartOfInterval`.
 
+Each method also takes an optional `source string` (empty = all sources); when set,
+the generated SQL adds `AND source = ?`. `FlowsFiltered`'s filter struct includes
+`Source` alongside the other filters.
+
 The API package depends on a `reader` interface (these method signatures) so tests
 can supply a fake — same pattern as the existing `alertWriter` interface.
 
@@ -144,6 +153,9 @@ can supply a fake — same pattern as the existing `alertWriter` interface.
 
 **Common query params**
 - `range` — one of `15m|1h|6h|24h|7d` (default `1h`). Invalid → `400`.
+- `source` — optional source address (from B1). When present, the query is scoped
+  to flows/alerts stamped with that source via a `WHERE source = ?` clause. Applies
+  to all metrics, geo, alerts, and flows endpoints. Omitted → all sources.
 - `limit` — default 50, max 500. `offset` — default 0.
 
 **Endpoint contracts**
@@ -254,6 +266,7 @@ coordinates with a static centroid lookup. No schema change.
 |------|--------|
 | `backend/internal/auth/{repository,password,jwt,middleware}.go` | New — auth package. |
 | `backend/internal/api/{router,metrics,geo,alerts,flows,hub,stream}.go` | New — API + WS package. |
+| `backend/internal/api/sources.go` | New — source endpoints (`GET /api/sources`, `/:id`, `PATCH /:id`) over the B1 registry. |
 | `backend/internal/storage/clickhouse.go` (or `queries.go`) | Add read-query methods. |
 | `backend/cmd/server/main.go` | Wire auth, hub, broadcaster, alert bridge, routes. Remove stubs. |
 | `db/postgres/init-db.sql` | Add `users` table. |

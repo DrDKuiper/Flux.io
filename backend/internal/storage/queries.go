@@ -32,7 +32,7 @@ func (s *ClickHouseStore) Overview(ctx context.Context, since time.Time, source 
 func (s *ClickHouseStore) TopTalkers(ctx context.Context, since time.Time, source string, limit int) ([]Talker, error) {
 	clause, srcArgs := srcClause(source)
 	args := append([]any{since}, srcArgs...)
-	args = append(args, limit)
+	args = append(args, uint64(limit))
 	rows, err := s.conn.Query(ctx, `
 		SELECT toString(src_ip), any(src_hostname), sum(bytes), sum(packets), count()
 		FROM network_flows WHERE timestamp >= ?`+clause+`
@@ -55,7 +55,7 @@ func (s *ClickHouseStore) TopTalkers(ctx context.Context, since time.Time, sourc
 func (s *ClickHouseStore) TopApps(ctx context.Context, since time.Time, source string, limit int) ([]AppCount, error) {
 	clause, srcArgs := srcClause(source)
 	args := append([]any{since}, srcArgs...)
-	args = append(args, limit)
+	args = append(args, uint64(limit))
 	rows, err := s.conn.Query(ctx, `
 		SELECT application_id, sum(bytes), count()
 		FROM network_flows WHERE timestamp >= ? AND application_id != ''`+clause+`
@@ -154,7 +154,7 @@ func (s *ClickHouseStore) FlowsFiltered(ctx context.Context, f FlowFilter) (uint
 	if limit <= 0 {
 		limit = 50
 	}
-	pageArgs := append(append([]any{}, args...), limit, f.Offset)
+	pageArgs := append(append([]any{}, args...), uint64(limit), uint64(f.Offset))
 	rows, err := s.conn.Query(ctx, `
 		SELECT timestamp, source, toString(src_ip), toString(dst_ip), src_port, dst_port, protocol,
 		       bytes, packets, application_id, sni, http_host, src_country, dst_country, src_asn_org, dst_asn_org
@@ -187,7 +187,7 @@ func (s *ClickHouseStore) AlertsHistory(ctx context.Context, since time.Time, so
 	if limit <= 0 {
 		limit = 50
 	}
-	pageArgs := append(append([]any{}, countArgs...), limit, offset)
+	pageArgs := append(append([]any{}, countArgs...), uint64(limit), uint64(offset))
 	rows, err := s.conn.Query(ctx, `
 		SELECT timestamp, source, toString(src_ip), toString(dst_ip), alert_signature, alert_category, alert_severity
 		FROM suricata_alerts WHERE timestamp >= ?`+clause+`

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"log"
 	"os"
 	"time"
@@ -123,8 +125,16 @@ func main() {
 	// Auth: JWT signer + user repo + admin seed.
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
-		jwtSecret = "CHANGE_ME_INSECURE_DEFAULT"
-		log.Println("WARNING: JWT_SECRET not set; using an insecure default. Set JWT_SECRET in .env.")
+		// Generate a random secret rather than fall back to a known constant
+		// (a public default would let anyone forge admin tokens). This secret is
+		// ephemeral: tokens are invalidated on restart, so set JWT_SECRET in .env
+		// for stable sessions across restarts.
+		buf := make([]byte, 32)
+		if _, err := rand.Read(buf); err != nil {
+			log.Fatalf("auth: failed to generate a random JWT secret: %v", err)
+		}
+		jwtSecret = base64.RawURLEncoding.EncodeToString(buf)
+		log.Println("WARNING: JWT_SECRET not set; generated an ephemeral one. Tokens reset on restart — set JWT_SECRET in .env to persist sessions.")
 	}
 	signer := auth.NewJWT(jwtSecret, 24*time.Hour)
 	userRepo := auth.NewRepository(pgDB)

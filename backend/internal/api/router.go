@@ -1,8 +1,6 @@
 package api
 
 import (
-	"context"
-
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/websocket/v2"
 
@@ -70,7 +68,7 @@ func loginHandler(repo *auth.Repository, signer *auth.JWT) fiber.Handler {
 		if err := c.BodyParser(&body); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 		}
-		u, err := repo.GetByUsername(context.Background(), body.Username)
+		u, err := repo.GetByUsername(c.Context(), body.Username)
 		if err != nil || !auth.CheckPassword(u.PasswordHash, body.Password) {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid credentials"})
 		}

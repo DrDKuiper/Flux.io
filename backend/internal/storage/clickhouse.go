@@ -32,13 +32,21 @@ func NewClickHouseStore(dsn string) (*ClickHouseStore, error) {
 	return &ClickHouseStore{conn: conn}, nil
 }
 
+var flowInsertSQL = `INSERT INTO network_flows (
+	timestamp, source, src_ip, dst_ip, src_port, dst_port, protocol, bytes, packets,
+	application_id, sni, http_host, http_url,
+	src_country, dst_country, src_asn, dst_asn, src_asn_org, dst_asn_org,
+	src_hostname, dst_hostname, is_alert, alert_severity, alert_signature
+)`
+
+var alertInsertSQL = `INSERT INTO suricata_alerts (
+	timestamp, source, src_ip, dst_ip, src_port, dst_port, protocol,
+	alert_action, alert_gid, alert_signature_id, alert_rev,
+	alert_signature, alert_category, alert_severity, payload
+)`
+
 func (s *ClickHouseStore) InsertFlows(ctx context.Context, records []processor.FlowRecord) error {
-	batch, err := s.conn.PrepareBatch(ctx, `INSERT INTO network_flows (
-		timestamp, src_ip, dst_ip, src_port, dst_port, protocol, bytes, packets,
-		application_id, sni, http_host, http_url,
-		src_country, dst_country, src_asn, dst_asn, src_asn_org, dst_asn_org,
-		src_hostname, dst_hostname, is_alert, alert_severity, alert_signature
-	)`)
+	batch, err := s.conn.PrepareBatch(ctx, flowInsertSQL)
 	if err != nil {
 		return fmt.Errorf("clickhouse: prepare flow batch: %w", err)
 	}
@@ -49,7 +57,7 @@ func (s *ClickHouseStore) InsertFlows(ctx context.Context, records []processor.F
 			isAlert = 1
 		}
 		err := batch.Append(
-			r.Timestamp, r.SourceIP, r.DestinationIP, r.SourcePort, r.DestinationPort,
+			r.Timestamp, r.Source, r.SourceIP, r.DestinationIP, r.SourcePort, r.DestinationPort,
 			r.Protocol, r.Bytes, r.Packets,
 			r.Application, r.SNI, r.HTTPHost, r.HTTPURL,
 			r.SourceCountry, r.DestCountry, r.SourceASN, r.DestASN, r.SourceASNOrg, r.DestASNOrg,
@@ -63,18 +71,14 @@ func (s *ClickHouseStore) InsertFlows(ctx context.Context, records []processor.F
 }
 
 func (s *ClickHouseStore) InsertAlerts(ctx context.Context, alerts []processor.SuricataAlert) error {
-	batch, err := s.conn.PrepareBatch(ctx, `INSERT INTO suricata_alerts (
-		timestamp, src_ip, dst_ip, src_port, dst_port, protocol,
-		alert_action, alert_gid, alert_signature_id, alert_rev,
-		alert_signature, alert_category, alert_severity, payload
-	)`)
+	batch, err := s.conn.PrepareBatch(ctx, alertInsertSQL)
 	if err != nil {
 		return fmt.Errorf("clickhouse: prepare alert batch: %w", err)
 	}
 
 	for _, a := range alerts {
 		err := batch.Append(
-			a.Timestamp, a.SourceIP, a.DestinationIP, a.SourcePort, a.DestinationPort, a.Protocol,
+			a.Timestamp, "127.0.0.1", a.SourceIP, a.DestinationIP, a.SourcePort, a.DestinationPort, a.Protocol,
 			a.Action, a.GID, a.SignatureID, a.Rev,
 			a.Signature, a.Category, a.Severity, a.Payload,
 		)

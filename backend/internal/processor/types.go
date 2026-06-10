@@ -6,6 +6,7 @@ import "time"
 // mirroring the columns of the ClickHouse `network_flows` table.
 type FlowRecord struct {
 	Timestamp       time.Time
+	Source          string
 	SourceIP        string
 	DestinationIP   string
 	SourcePort      uint16

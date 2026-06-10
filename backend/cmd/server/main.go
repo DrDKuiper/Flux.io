@@ -1,12 +1,21 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"log"
 	"os"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/websocket/v2"
+	_ "github.com/lib/pq"
+
+	"fluxio-backend/internal/collector"
+	"fluxio-backend/internal/processor"
+	"fluxio-backend/internal/settings"
+	"fluxio-backend/internal/storage"
 )
 
 func main() {
@@ -45,6 +54,66 @@ func main() {
 	}))
 
 	api := app.Group("/api")
+
+	pgDB, err := sql.Open("postgres", os.Getenv("POSTGRES_DSN"))
+	if err != nil {
+		log.Fatalf("Failed to open Postgres connection: %v", err)
+	}
+	defer pgDB.Close()
+	settingsRepo := settings.NewRepository(pgDB)
+
+	pipelineCtx, cancelPipeline := context.WithCancel(context.Background())
+	defer cancelPipeline()
+
+	correlationCache := processor.NewCorrelationCache(30 * time.Second)
+	go correlationCache.CleanupLoop(pipelineCtx, 10*time.Second)
+
+	eveLogPath := os.Getenv("SURICATA_EVE_LOG_PATH")
+	if eveLogPath == "" {
+		eveLogPath = "/var/log/suricata/eve.json"
+	}
+	tzspPort := os.Getenv("TZSP_PORT")
+	if tzspPort == "" {
+		tzspPort = "37008"
+	}
+
+	store, err := storage.NewClickHouseStore(os.Getenv("CLICKHOUSE_DSN"))
+	if err != nil {
+		log.Fatalf("Failed to connect to ClickHouse: %v", err)
+	}
+
+	writer := storage.NewBatchWriter(store, 1000, 5*time.Second)
+	go writer.Run(pipelineCtx)
+
+	dpiManager := collector.NewDPIManager(correlationCache, collector.DPIManagerSources{
+		Suricata: func(ctx context.Context) {
+			collector.RunSuricataCorrelator(ctx, collector.NewFileTailer(eveLogPath), correlationCache, writer)
+		},
+		TZSP: func(ctx context.Context) {
+			if err := collector.StartTZSPListener(ctx, tzspPort, correlationCache); err != nil {
+				log.Printf("tzsp: listener stopped: %v", err)
+			}
+		},
+	})
+
+	startupMode, err := settingsRepo.GetDPIMode(context.Background())
+	if err != nil {
+		log.Printf("Failed to read saved DPI mode, defaulting to 'none': %v", err)
+		startupMode = "none"
+	}
+	if err := dpiManager.SetMode(pipelineCtx, startupMode); err != nil {
+		log.Printf("Failed to start DPI mode %q: %v", startupMode, err)
+	}
+
+	registerSettingsRoutes(api, settingsRepo, dpiManager)
+
+	wazuhIP := os.Getenv("WAZUH_MANAGER_IP")
+	wazuhPort := os.Getenv("WAZUH_MANAGER_PORT")
+	if wazuhPort == "" {
+		wazuhPort = "1514"
+	}
+	go collector.RunWazuhForwarder(pipelineCtx, eveLogPath, wazuhIP, wazuhPort)
+
 	api.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
@@ -84,12 +153,37 @@ func main() {
 		port = "8080"
 	}
 
-	// Inicializa o Wazuh Forwarder em background (Goroutine)
-	wazuhIP := os.Getenv("WAZUH_MANAGER_IP")
-	wazuhPort := os.Getenv("WAZUH_MANAGER_PORT")
-	// import "fluxio-backend/internal/collector" seria necessário aqui na vida real,
-	// porém como estamos demonstrando o esqueleto, omitimos o start se não estiver na GOPATH 
-	log.Printf("Wazuh Integration configured for: %s:%s", wazuhIP, wazuhPort)
+	geoIP, err := processor.NewGeoIPEnricher(os.Getenv("GEOIP_CITY_DB"), os.Getenv("GEOIP_ASN_DB"))
+	if err != nil {
+		log.Fatalf("Failed to initialize GeoIP enrichment: %v", err)
+	}
+	defer geoIP.Close()
+
+	flowCh := make(chan processor.FlowRecord, 10000)
+	go func() {
+		for flow := range flowCh {
+			geoIP.EnrichFlow(&flow)
+
+			tuple := processor.FiveTuple{
+				SrcIP: flow.SourceIP, DstIP: flow.DestinationIP,
+				SrcPort: flow.SourcePort, DstPort: flow.DestinationPort, Protocol: flow.Protocol,
+			}
+			if meta, ok := correlationCache.Get(tuple); ok {
+				flow.Application = meta.Application
+				flow.SNI = meta.SNI
+				flow.HTTPHost = meta.HTTPHost
+				flow.HTTPURL = meta.HTTPURL
+			}
+
+			writer.WriteFlow(flow)
+		}
+	}()
+
+	netflowPort := os.Getenv("NETFLOW_PORT")
+	if netflowPort == "" {
+		netflowPort = "2055"
+	}
+	go collector.StartNetFlowListener(netflowPort, flowCh)
 
 	log.Printf("Starting Flux.io Backend on :%s", port)
 	if err := app.Listen(":" + port); err != nil {

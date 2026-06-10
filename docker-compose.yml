@@ -21,6 +21,7 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./db/postgres/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
     restart: unless-stopped
 
   suricata:

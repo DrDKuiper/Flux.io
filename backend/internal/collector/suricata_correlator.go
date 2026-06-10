@@ -15,6 +15,10 @@ type alertWriter interface {
 	WriteAlert(alert processor.SuricataAlert)
 }
 
+// AlertHook, if set, is called for every Suricata alert in addition to
+// persistence — used to bridge alerts to the live WebSocket. Set once at startup.
+var AlertHook func(processor.SuricataAlert)
+
 // RunSuricataCorrelator tails eve.json via tailer, storing any DPI metadata
 // it finds (TLS SNI, DNS queries, HTTP hosts) into cache keyed by 5-tuple,
 // and forwarding any `alert` events to alerts for persistence. It blocks
@@ -54,5 +58,8 @@ func processEveLine(line string, cache *processor.CorrelationCache, alerts alert
 
 	if alert, ok := evt.ToAlert(); ok {
 		alerts.WriteAlert(alert)
+		if AlertHook != nil {
+			AlertHook(alert)
+		}
 	}
 }

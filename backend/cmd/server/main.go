@@ -9,66 +9,36 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
-	"github.com/gofiber/websocket/v2"
 	_ "github.com/lib/pq"
 
+	"fluxio-backend/internal/api"
+	"fluxio-backend/internal/auth"
 	"fluxio-backend/internal/collector"
 	"fluxio-backend/internal/processor"
-	"fluxio-backend/internal/settings"
 	"fluxio-backend/internal/sources"
 	"fluxio-backend/internal/storage"
 )
 
-// noopSwitcher satisfies the settings route's modeSwitcher without acting on a
-// live listener. The global DPI mode is superseded by per-source dpi_mode; this
-// keeps the legacy /api/settings route compiling until B2 removes it.
-type noopSwitcher struct{}
-
-func (noopSwitcher) SetMode(context.Context, string) error { return nil }
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
 func main() {
 	app := fiber.New()
 
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
-		AllowHeaders: "Origin, Content-Type, Accept",
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
 	}))
-
-	// Setup websocket route for alerts
-	app.Use("/ws", func(c *fiber.Ctx) error {
-		if websocket.IsWebSocketUpgrade(c) {
-			c.Locals("allowed", true)
-			return c.Next()
-		}
-		return fiber.ErrUpgradeRequired
-	})
-
-	app.Get("/ws/alerts", websocket.New(func(c *websocket.Conn) {
-		log.Println("WebSocket client connected")
-		for {
-			// This is a stub for the websocket connection
-			// In a real app, you would read from a channel or a message broker
-			messageType, msg, err := c.ReadMessage()
-			if err != nil {
-				log.Println("Read err:", err)
-				break
-			}
-			log.Printf("Received: %s", msg)
-			if err = c.WriteMessage(messageType, msg); err != nil {
-				log.Println("Write err:", err)
-				break
-			}
-		}
-	}))
-
-	api := app.Group("/api")
 
 	pgDB, err := sql.Open("postgres", os.Getenv("POSTGRES_DSN"))
 	if err != nil {
 		log.Fatalf("Failed to open Postgres connection: %v", err)
 	}
 	defer pgDB.Close()
-	settingsRepo := settings.NewRepository(pgDB)
 
 	pipelineCtx, cancelPipeline := context.WithCancel(context.Background())
 	defer cancelPipeline()
@@ -131,7 +101,7 @@ func main() {
 
 	// The DPI manager runs the union of mechanisms the enabled sources request
 	// (per-source dpi_mode). A reconcile loop applies changes made via the
-	// Sources API without a restart. This supersedes the old global dpi_mode.
+	// Sources API without a restart.
 	reconcile := func() {
 		suri, tzsp := sourceReg.RequestedMechanisms()
 		dpiManager.Reconcile(pipelineCtx, suri, tzsp)
@@ -150,9 +120,36 @@ func main() {
 		}
 	}()
 
-	// The global /api/settings route is retained but inert (its switch is a
-	// no-op); per-source DPI mode supersedes it and B2 removes it entirely.
-	registerSettingsRoutes(api, settingsRepo, noopSwitcher{})
+	// Auth: JWT signer + user repo + admin seed.
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		jwtSecret = "CHANGE_ME_INSECURE_DEFAULT"
+		log.Println("WARNING: JWT_SECRET not set; using an insecure default. Set JWT_SECRET in .env.")
+	}
+	signer := auth.NewJWT(jwtSecret, 24*time.Hour)
+	userRepo := auth.NewRepository(pgDB)
+	adminUser := envOr("ADMIN_USERNAME", "admin")
+	if pw, err := auth.SeedAdmin(context.Background(), userRepo, adminUser, os.Getenv("ADMIN_PASSWORD")); err != nil {
+		log.Printf("auth: admin seed failed: %v", err)
+	} else if pw != "" {
+		log.Printf("auth: created admin user %q with generated password: %s", adminUser, pw)
+	}
+
+	// WebSocket hub + live producers.
+	hub := api.NewHub()
+	go hub.Run()
+	go api.RunMetricsBroadcaster(pipelineCtx, hub, store)
+	collector.AlertHook = func(a processor.SuricataAlert) {
+		api.BroadcastAlert(hub, storage.AlertRow{
+			TS: a.Timestamp, Source: "127.0.0.1", SrcIP: a.SourceIP, DstIP: a.DestinationIP,
+			Signature: a.Signature, Category: a.Category, Severity: a.Severity,
+		})
+	}
+
+	api.RegisterRoutes(app, api.Deps{
+		Reader: store, Signer: signer, UserRepo: userRepo, Hub: hub,
+		SourceReg: sourceReg, SourceRepo: sourceRepo, SourceStats: sourceStats,
+	})
 
 	wazuhIP := os.Getenv("WAZUH_MANAGER_IP")
 	wazuhPort := os.Getenv("WAZUH_MANAGER_PORT")
@@ -161,37 +158,10 @@ func main() {
 	}
 	go collector.RunWazuhForwarder(pipelineCtx, eveLogPath, wazuhIP, wazuhPort)
 
-	api.Get("/health", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"status": "ok"})
-	})
-
-	api.Post("/auth/login", func(c *fiber.Ctx) error {
-		// Stub para gerar JWT. Em produção, buscar o hash Argon2id do Postgres.
-		type LoginReq struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
-		}
-		var req LoginReq
-		if err := c.BodyParser(&req); err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
-		}
-		
-		if req.Username == "admin" && req.Password == "admin" {
-			// Retornar um token JWT mockado para cumprir o stub da interface
-			return c.JSON(fiber.Map{
-				"token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.mock.token",
-				"role":  "Admin",
-			})
-		}
-		return c.Status(401).JSON(fiber.Map{"error": "Unauthorized"})
-	})
-
-	// Servir o Frontend Estático construído pelo React (SPA)
+	// Serve the React SPA built into ./public, with a fallback to index.html so
+	// client-side routing works. Registered after the API/WS routes so they win.
 	app.Static("/", "./public")
-
-	// Rota de Fallback para o React Router lidar com a navegação interna
 	app.Use(func(c *fiber.Ctx) error {
-		// Se não for rota da API ou WS, retorna o index.html do frontend
 		return c.SendFile("./public/index.html")
 	})
 

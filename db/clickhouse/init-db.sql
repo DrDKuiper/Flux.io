@@ -5,6 +5,7 @@ USE fluxio;
 CREATE TABLE IF NOT EXISTS network_flows
 (
     timestamp DateTime64(3, 'UTC'),
+    source String,
     src_ip IPv6,
     dst_ip IPv6,
     src_port UInt16,
@@ -36,6 +37,7 @@ SETTINGS index_granularity = 8192;
 CREATE TABLE IF NOT EXISTS suricata_alerts
 (
     timestamp DateTime64(3, 'UTC'),
+    source String,
     src_ip IPv6,
     dst_ip IPv6,
     src_port UInt16,
